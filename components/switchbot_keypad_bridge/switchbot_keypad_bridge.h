@@ -1,6 +1,7 @@
 #pragma once
 
 #include <NimBLEDevice.h>
+#include <psa/crypto.h>
 
 #include <array>
 #include <cstdint>
@@ -110,6 +111,13 @@ class SwitchbotKeypadBridge : public Component {
   bool aes_ctr_xcrypt_(const uint8_t *input, size_t length, uint8_t *output);
   void rotate_session_iv_();
 
+  // ----- Anti-replay ---------------------------------------------------------
+
+  void reset_session_state_();
+  void clear_replay_history_();
+  bool is_replayed_ciphertext_(const uint8_t *ciphertext, size_t length) const;
+  void record_ciphertext_(const uint8_t *ciphertext, size_t length);
+
   // ----- Eventing ------------------------------------------------------------
 
   void publish_lock_();
@@ -132,12 +140,26 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- Runtime state -------------------------------------------------------
 
-  std::array<uint8_t, 16> aes_key_{};
+  // PSA AES-CTR key handle. Imported once at setup so the per-frame crypto
+  // path does not pay the cost (or risk the failure) of re-importing it.
+  psa_key_id_t aes_key_handle_{PSA_KEY_ID_NULL};
   LockState lock_state_{LockState::LOCKED};
 
   // 20-byte session IV response: [0x01, 0x00, 0x00, 0x00, IV(16)].
   // The trailing 16 bytes are also used as the AES-CTR IV for the live session.
   std::array<uint8_t, 20> session_iv_response_{0x01, 0x00, 0x00, 0x00};
+
+  // Per-session anti-replay state. Reset on connect, disconnect, and on
+  // every IV re-negotiation.
+  static constexpr size_t REPLAY_HISTORY_SIZE = 8;
+  static constexpr size_t MAX_REPLAY_PAYLOAD = 32;
+  struct ReplayEntry {
+    std::array<uint8_t, MAX_REPLAY_PAYLOAD> data{};
+    size_t length{0};
+  };
+  std::array<ReplayEntry, REPLAY_HISTORY_SIZE> replay_history_{};
+  size_t replay_head_{0};
+  bool iv_established_{false};
 };
 
 }  // namespace switchbot_keypad_bridge

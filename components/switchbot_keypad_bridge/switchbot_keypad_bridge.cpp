@@ -2,7 +2,6 @@
 
 #include <cstdio>
 #include <cstring>
-#include <vector>
 
 #include <esp_random.h>
 #include <psa/crypto.h>
@@ -46,9 +45,8 @@ constexpr size_t   MAX_PAYLOAD_LEN     = 32;
 constexpr size_t   MIN_PAYLOAD_LEN     = 4;
 
 // Session IV negotiation: first frame received after connect.
+// Shape: 57 00 00 00 0F 21 03 <key_id>
 constexpr size_t   SESSION_IV_REQ_MIN  = 8;
-constexpr uint8_t  SESSION_IV_REQ_BYTE5 = 0x21;
-constexpr uint8_t  SESSION_IV_REQ_BYTE6 = 0x03;
 
 // Unlock frame layout: [hdr(4) | method | marker(0x80) | index | ...]
 constexpr size_t   UNLOCK_METHOD_OFFSET = 4;
@@ -105,10 +103,12 @@ class SwitchbotKeypadBridge::ServerCallbacks : public NimBLEServerCallbacks {
 
   void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
     ESP_LOGI(TAG, "Keypad connected: %s", info.getAddress().toString().c_str());
+    this->parent_->reset_session_state_();
   }
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &info, int reason) override {
     ESP_LOGI(TAG, "Keypad disconnected (reason=0x%02X), restarting advertising", reason);
+    this->parent_->reset_session_state_();
     NimBLEDevice::startAdvertising();
   }
 
@@ -156,13 +156,31 @@ void SwitchbotKeypadBridge::dump_config() {
 }
 
 bool SwitchbotKeypadBridge::prepare_keys_() {
-  const psa_status_t status = psa_crypto_init();
+  psa_status_t status = psa_crypto_init();
   if (status != PSA_SUCCESS) {
     ESP_LOGE(TAG, "PSA Crypto init failed (%d)", static_cast<int>(status));
     return false;
   }
-  if (!parse_hex(this->shared_key_hex_, this->aes_key_.data(), this->aes_key_.size())) {
+
+  uint8_t key_bytes[AES_KEY_SIZE];
+  if (!parse_hex(this->shared_key_hex_, key_bytes, AES_KEY_SIZE)) {
     ESP_LOGE(TAG, "Invalid shared_key: expected 32 hexadecimal characters");
+    return false;
+  }
+
+  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
+  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
+  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
+  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
+  psa_set_key_bits(&attrs, 128);
+  status = psa_import_key(&attrs, key_bytes, AES_KEY_SIZE, &this->aes_key_handle_);
+  psa_reset_key_attributes(&attrs);
+  // The PSA implementation now owns the key material — wipe the local copy
+  // so it does not linger on the stack.
+  std::memset(key_bytes, 0, sizeof(key_bytes));
+
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "AES key import failed (%d)", static_cast<int>(status));
     return false;
   }
   return true;
@@ -198,7 +216,7 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
            format_hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
 
   if (this->is_session_iv_request_(frame)) {
-    ESP_LOGD(TAG, "Session IV request received");
+    ESP_LOGD(TAG, "IV request: key_id=0x%02X", static_cast<uint8_t>(frame[7]));
     this->send_session_iv_();
     return;
   }
@@ -217,24 +235,57 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
     return;
   }
 
+  // Refuse encrypted frames before the IV handshake completed in this session.
+  // A captured ciphertext from a previous connection would otherwise decrypt
+  // against the wrong (or stale) IV and ride on whatever lock_state_ is set.
+  if (!this->iv_established_) {
+    ESP_LOGW(TAG, "Dropping encrypted frame: no IV negotiated in this session");
+    return;
+  }
+
+  // The protocol echoes IV[0..1] back as the seq_a/seq_b header bytes.
+  // Reject anything that does not match the IV we just issued — this blocks
+  // cross-session replay of captured ciphertexts.
+  if (header.seq_a != this->session_iv_response_[IV_RESPONSE_HEADER] ||
+      header.seq_b != this->session_iv_response_[IV_RESPONSE_HEADER + 1]) {
+    ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (cross-session replay?)");
+    return;
+  }
+
   const size_t ct_len = frame.size() - ENCRYPTED_HEADER;
   if (ct_len < MIN_PAYLOAD_LEN || ct_len > MAX_PAYLOAD_LEN) {
     ESP_LOGW(TAG, "Dropping frame with invalid payload length: %zu", ct_len);
     return;
   }
 
-  std::vector<uint8_t> plaintext(ct_len);
-  if (!this->aes_ctr_xcrypt_(reinterpret_cast<const uint8_t *>(frame.data() + ENCRYPTED_HEADER),
-                             ct_len, plaintext.data())) {
+  const uint8_t *ciphertext = reinterpret_cast<const uint8_t *>(frame.data() + ENCRYPTED_HEADER);
+
+  // Intra-session replay protection for state-changing actions: under a
+  // fixed session IV, identical plaintexts produce identical ciphertexts.
+  // We only flag duplicates that decode to a side-effecting command — state
+  // polls are idempotent and a legitimate keypad emits them repeatedly.
+  const bool ciphertext_seen = this->is_replayed_ciphertext_(ciphertext, ct_len);
+
+  uint8_t plaintext[MAX_PAYLOAD_LEN];
+  if (!this->aes_ctr_xcrypt_(ciphertext, ct_len, plaintext)) {
     return;  // error already logged
   }
 
   DecodedCommand command;
-  if (!this->decode_command_(plaintext.data(), ct_len, command)) {
-    ESP_LOGD(TAG, "Unknown command payload: %s", format_hex_pretty(plaintext.data(), ct_len).c_str());
+  if (!this->decode_command_(plaintext, ct_len, command)) {
+    ESP_LOGD(TAG, "Unknown command payload: %s", format_hex_pretty(plaintext, ct_len).c_str());
     this->send_ack_(header);
     return;
   }
+
+  if (command.type == CommandType::LOCK || command.type == CommandType::UNLOCK) {
+    if (ciphertext_seen) {
+      ESP_LOGW(TAG, "Dropping action: ciphertext replay within session");
+      return;
+    }
+    this->record_ciphertext_(ciphertext, ct_len);
+  }
+
   this->handle_command_(header, command);
 }
 
@@ -242,12 +293,15 @@ bool SwitchbotKeypadBridge::is_session_iv_request_(const std::string &frame) con
   return frame.size() >= SESSION_IV_REQ_MIN &&
          static_cast<uint8_t>(frame[0]) == PROTOCOL_MAGIC &&
          static_cast<uint8_t>(frame[1]) == 0x00 &&
-         static_cast<uint8_t>(frame[5]) == SESSION_IV_REQ_BYTE5 &&
-         static_cast<uint8_t>(frame[6]) == SESSION_IV_REQ_BYTE6;
+         static_cast<uint8_t>(frame[5]) == 0x21 &&
+         static_cast<uint8_t>(frame[6]) == 0x03;
 }
 
 void SwitchbotKeypadBridge::send_session_iv_() {
   this->rotate_session_iv_();
+  // A new IV invalidates any ciphertext sniffed under the previous one.
+  this->clear_replay_history_();
+  this->iv_established_ = true;
   this->notify_(this->session_iv_response_.data(), this->session_iv_response_.size());
 }
 
@@ -298,7 +352,7 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       return;
 
     case CommandType::STATE_POLL:
-      ESP_LOGD(TAG, "State poll received");
+      ESP_LOGV(TAG, "State poll");
       this->handle_state_poll_(header);
       return;
 
@@ -327,15 +381,19 @@ void SwitchbotKeypadBridge::send_ack_(const FrameHeader &header) {
 
 void SwitchbotKeypadBridge::send_encrypted_response_(const FrameHeader &header,
                                                     const uint8_t *plaintext, size_t length) {
-  std::vector<uint8_t> packet(ENCRYPTED_HEADER + length);
+  if (length > MAX_PAYLOAD_LEN) {
+    ESP_LOGE(TAG, "Response payload too large (%zu > %zu)", length, MAX_PAYLOAD_LEN);
+    return;
+  }
+  uint8_t packet[ENCRYPTED_HEADER + MAX_PAYLOAD_LEN];
   packet[0] = 0x01;
   packet[1] = header.key_id;
   packet[2] = header.seq_a;
   packet[3] = header.seq_b;
-  if (!this->aes_ctr_xcrypt_(plaintext, length, packet.data() + ENCRYPTED_HEADER)) {
+  if (!this->aes_ctr_xcrypt_(plaintext, length, packet + ENCRYPTED_HEADER)) {
     return;
   }
-  this->notify_(packet.data(), packet.size());
+  this->notify_(packet, ENCRYPTED_HEADER + length);
 }
 
 void SwitchbotKeypadBridge::notify_(const uint8_t *data, size_t length) {
@@ -348,25 +406,11 @@ void SwitchbotKeypadBridge::notify_(const uint8_t *data, size_t length) {
 // ---------------------------------------------------------------------------
 
 bool SwitchbotKeypadBridge::aes_ctr_xcrypt_(const uint8_t *input, size_t length, uint8_t *output) {
-  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
-  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
-  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
-  psa_set_key_bits(&attrs, 128);
-
-  psa_key_id_t key_id = PSA_KEY_ID_NULL;
-  psa_status_t status = psa_import_key(&attrs, this->aes_key_.data(), this->aes_key_.size(), &key_id);
-  psa_reset_key_attributes(&attrs);
-  if (status != PSA_SUCCESS) {
-    ESP_LOGE(TAG, "AES key import failed (%d)", static_cast<int>(status));
-    return false;
-  }
-
   psa_cipher_operation_t op = PSA_CIPHER_OPERATION_INIT;
   size_t out_len = 0;
   size_t finish_len = 0;
 
-  status = psa_cipher_encrypt_setup(&op, key_id, PSA_ALG_CTR);
+  psa_status_t status = psa_cipher_encrypt_setup(&op, this->aes_key_handle_, PSA_ALG_CTR);
   if (status == PSA_SUCCESS) {
     status = psa_cipher_set_iv(&op, this->session_iv_response_.data() + IV_RESPONSE_HEADER, AES_IV_SIZE);
   }
@@ -380,9 +424,9 @@ bool SwitchbotKeypadBridge::aes_ctr_xcrypt_(const uint8_t *input, size_t length,
   if (status != PSA_SUCCESS) {
     ESP_LOGE(TAG, "AES-CTR operation failed (%d)", static_cast<int>(status));
     psa_cipher_abort(&op);
+    return false;
   }
-  psa_destroy_key(key_id);
-  return status == PSA_SUCCESS;
+  return true;
 }
 
 void SwitchbotKeypadBridge::rotate_session_iv_() {
@@ -390,8 +434,46 @@ void SwitchbotKeypadBridge::rotate_session_iv_() {
     const uint32_t value = esp_random();
     std::memcpy(this->session_iv_response_.data() + IV_RESPONSE_HEADER + i, &value, 4);
   }
-  ESP_LOGV(TAG, "Session IV rotated: %s",
+  ESP_LOGV(TAG, "IV rotated: %s",
            format_hex_pretty(this->session_iv_response_.data() + IV_RESPONSE_HEADER, AES_IV_SIZE).c_str());
+}
+
+// ---------------------------------------------------------------------------
+// Anti-replay
+// ---------------------------------------------------------------------------
+
+void SwitchbotKeypadBridge::reset_session_state_() {
+  this->iv_established_ = false;
+  this->clear_replay_history_();
+}
+
+void SwitchbotKeypadBridge::clear_replay_history_() {
+  this->replay_head_ = 0;
+  for (auto &entry : this->replay_history_) {
+    entry.length = 0;
+  }
+}
+
+bool SwitchbotKeypadBridge::is_replayed_ciphertext_(const uint8_t *ciphertext, size_t length) const {
+  if (length == 0 || length > MAX_REPLAY_PAYLOAD) {
+    return false;
+  }
+  for (const auto &entry : this->replay_history_) {
+    if (entry.length == length && std::memcmp(entry.data.data(), ciphertext, length) == 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+void SwitchbotKeypadBridge::record_ciphertext_(const uint8_t *ciphertext, size_t length) {
+  if (length == 0 || length > MAX_REPLAY_PAYLOAD) {
+    return;
+  }
+  ReplayEntry &slot = this->replay_history_[this->replay_head_];
+  std::memcpy(slot.data.data(), ciphertext, length);
+  slot.length = length;
+  this->replay_head_ = (this->replay_head_ + 1) % REPLAY_HISTORY_SIZE;
 }
 
 // ---------------------------------------------------------------------------
