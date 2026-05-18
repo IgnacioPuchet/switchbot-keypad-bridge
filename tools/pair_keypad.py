@@ -8,10 +8,8 @@ Where to find the addresses:
     KEYPAD_MAC  SwitchBot app -> open the keypad device -> ... -> Device Info -> BLE Address
     ESP_MAC     ESPHome boot log ("BLE address: ...") or Home Assistant device page ("BLE MAC" sensor)
 
-The keypad model (Original/Touch vs Vision/Vision Pro) is auto-detected from
-the user-credential key_id returned by the SwitchBot cloud — see
-KEYPAD_PRESETS below. The bridge firmware must be configured with the same
-"token slot" id (default 0x88 = Original; the Vision uses 0xC6).
+The keypad model is auto-detected from the SwitchBot cloud device list and
+the right pairing dialect is selected automatically.
 """
 
 import argparse
@@ -51,9 +49,8 @@ def _api_post(url: str, data: dict | None = None, headers: dict | None = None) -
     return result["body"]
 
 
-def fetch_keypad_credentials(keypad_mac: str, username: str, password: str) -> tuple[int, bytes]:
-    print("Fetching keypad credentials...")
-
+def _login(username: str, password: str) -> dict[str, str]:
+    """Authenticate against the SwitchBot account API. Returns request headers."""
     auth = _api_post(
         f"{_API_ACCOUNT_BASE}/account/api/v1/user/login",
         {
@@ -64,21 +61,50 @@ def fetch_keypad_credentials(keypad_mac: str, username: str, password: str) -> t
             "verifyCode": "",
         },
     )
-    auth_headers = {"authorization": auth["access_token"]}
+    return {"authorization": auth["access_token"]}
 
+
+def _resolve_region(auth_headers: dict[str, str]) -> str:
     try:
         userinfo = _api_post(
             f"{_API_ACCOUNT_BASE}/account/api/v1/user/userinfo",
             headers=auth_headers,
         )
-        region = userinfo.get("botRegion") or "us"
+        return userinfo.get("botRegion") or "us"
     except Exception:
-        region = "us"
+        return "us"
 
-    mac = keypad_mac.replace(":", "").replace("-", "").upper()
+
+def _normalise_mac(mac: str) -> str:
+    return mac.replace(":", "").replace("-", "").upper()
+
+
+def fetch_device_type(keypad_mac: str, region: str, auth_headers: dict[str, str]) -> str | None:
+    """Look up the SwitchBot cloud `device_type` string for the given MAC.
+
+    Returns None if the device is not in the account or the API omits the
+    field. The string itself is a SwitchBot SKU / model code (e.g.
+    `"WoKeypad"`, `"WoKeypadTouch"`, `"WoKeypadVision"`) and is mapped to
+    a protocol family by `classify_device_type`.
+    """
+    devices = _api_post(
+        f"https://wonderlabs.{region}.api.switchbot.net/wonder/device/v3/getdevice",
+        {"required_type": "All"},
+        auth_headers,
+    )
+    target = _normalise_mac(keypad_mac)
+    for item in devices.get("Items", []):
+        if _normalise_mac(item.get("device_mac", "")) != target:
+            continue
+        detail = item.get("device_detail") or {}
+        return detail.get("device_type")
+    return None
+
+
+def fetch_keypad_credentials(keypad_mac: str, region: str, auth_headers: dict[str, str]) -> tuple[int, bytes]:
     comm = _api_post(
         f"https://wonderlabs.{region}.api.switchbot.net/wonder/keys/v1/communicate",
-        {"device_mac": mac, "keyType": "user"},
+        {"device_mac": _normalise_mac(keypad_mac), "keyType": "user"},
         auth_headers,
     )
     key_info = comm["communicationKey"]
@@ -86,32 +112,36 @@ def fetch_keypad_credentials(keypad_mac: str, username: str, password: str) -> t
 
 
 # ---------------------------------------------------------------------------
-# Per-model pairing presets
+# Keypad-family classification and pairing presets
 # ---------------------------------------------------------------------------
 #
 # Different keypad families speak slightly different dialects of the same
-# pairing ceremony. The cloud API reports the per-device user credential
-# `key_id` (the one used to encrypt the pairing session), which doubles as a
-# reliable family fingerprint:
-#
-#   0x7E -> Keypad / Keypad Touch  (token slot 0x88, family 0x52)
-#   0x72 -> Keypad Vision / Vision Pro (token slot 0xC6, family 0x53)
-#
-# The bridge firmware needs to know which "token slot" the keypad will use to
-# look up its peer MAC at runtime, hence the same value is configured on both
-# sides.
+# pairing ceremony. We identify the family from the `device_type` string
+# the SwitchBot cloud reports for the keypad (the same field pySwitchbot
+# parses out of `wonder/device/v3/getdevice`). Examples observed in the
+# wild: "WoKeypad", "WoKeypadTouch", "WoKeypadVision".
 
+# Exact device_type → preset key. Anything not listed here goes through
+# the heuristic fallback in `classify_device_type`.
+DEVICE_TYPE_TO_PRESET = {
+    "WoKeypad":           ("Keypad",             "original"),
+    "WoKeypadTouch":      ("Keypad Touch",       "original"),
+    "WoKeypadVision":     ("Keypad Vision",      "vision"),
+    "WoKeypadVisionPro":  ("Keypad Vision Pro",  "vision"),
+}
+
+# Pairing dialect per family. The bridge firmware learns the shared_slot
+# at runtime from the IV-request frame, so nothing here needs to be
+# mirrored on the device side.
 KEYPAD_PRESETS = {
-    0x7E: {
-        "name": "Keypad / Keypad Touch",
+    "original": {
         "shared_slot": 0x88,
         "slot_init_nonce": 0x69,
         "enter_pairing": bytes.fromhex("0f52010700"),
         "capabilities_probe": None,
         "finalize_tail": bytes.fromhex("000809040507"),
     },
-    0x72: {
-        "name": "Keypad Vision / Vision Pro",
+    "vision": {
         "shared_slot": 0xC6,
         "slot_init_nonce": 0x80,
         "enter_pairing": bytes.fromhex("0f530107"),
@@ -119,6 +149,20 @@ KEYPAD_PRESETS = {
         "finalize_tail": bytes.fromhex("040401050809"),
     },
 }
+
+
+def classify_device_type(device_type: str) -> tuple[str, str]:
+    """Map a cloud `device_type` string to (friendly_name, preset_key).
+
+    Unknown SKUs are rejected — the table above is the single source of
+    truth and must be extended explicitly when SwitchBot ships a new model.
+    """
+    if device_type not in DEVICE_TYPE_TO_PRESET:
+        raise RuntimeError(
+            f"Unsupported keypad SKU {device_type!r}. Known SKUs: "
+            + ", ".join(sorted(DEVICE_TYPE_TO_PRESET))
+        )
+    return DEVICE_TYPE_TO_PRESET[device_type]
 
 
 # ---------------------------------------------------------------------------
@@ -177,18 +221,16 @@ class Pairer:
 
 
 async def _run_pairing(
-    keypad_mac: str, esp_mac: str, shared_token: bytes, key_id: int, key: bytes
+    keypad_mac: str,
+    esp_mac: str,
+    shared_token: bytes,
+    key_id: int,
+    key: bytes,
+    preset_key: str,
 ):
-    preset = KEYPAD_PRESETS.get(key_id)
-    if preset is None:
-        raise RuntimeError(
-            f"Unsupported keypad family (cloud reported key_id=0x{key_id:02X}). "
-            f"Known families: " + ", ".join(f"0x{k:02X} ({v['name']})" for k, v in KEYPAD_PRESETS.items())
-        )
-
+    preset = KEYPAD_PRESETS[preset_key]
     slot = preset["shared_slot"]
     nonce = preset["slot_init_nonce"]
-    print(f"Detected keypad: {preset['name']}")
 
     print("Pairing...")
     async with BleakClient(keypad_mac) as client:
@@ -244,7 +286,19 @@ def main():
     password = args.password or getpass.getpass("SwitchBot password: ")
 
     try:
-        key_id, key = fetch_keypad_credentials(args.keypad_mac, args.user, password)
+        auth_headers = _login(args.user, password)
+        region = _resolve_region(auth_headers)
+
+        device_type = fetch_device_type(args.keypad_mac, region, auth_headers)
+        if device_type is None:
+            print(
+                f"Error: {args.keypad_mac} is not in this SwitchBot account.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        friendly, preset_key = classify_device_type(device_type)
+
+        key_id, key = fetch_keypad_credentials(args.keypad_mac, region, auth_headers)
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -254,9 +308,10 @@ def main():
             file=sys.stderr,
         )
         sys.exit(1)
+    print(f"Detected keypad: {friendly}")
 
     try:
-        asyncio.run(_run_pairing(args.keypad_mac, args.esp_mac, shared_token, key_id, key))
+        asyncio.run(_run_pairing(args.keypad_mac, args.esp_mac, shared_token, key_id, key, preset_key))
     except RuntimeError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
