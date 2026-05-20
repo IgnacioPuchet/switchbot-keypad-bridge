@@ -66,27 +66,6 @@ constexpr size_t   AES_KEY_SIZE   = 16;
 constexpr size_t   AES_IV_SIZE    = 16;
 constexpr size_t   IV_RESPONSE_HEADER = 4;  // session_iv_response_ prefix before the IV bytes
 
-bool parse_hex(const std::string &hex, uint8_t *out, size_t len) {
-  if (hex.size() < len * 2)
-    return false;
-  for (size_t i = 0; i < len; ++i) {
-    if (std::sscanf(hex.c_str() + (i * 2), "%2hhx", &out[i]) != 1)
-      return false;
-  }
-  return true;
-}
-
-std::string format_hex_pretty(const uint8_t *data, size_t length) {
-  std::string out;
-  out.reserve(length * 3);
-  for (size_t i = 0; i < length; ++i) {
-    char tmp[4];
-    std::snprintf(tmp, sizeof(tmp), "%02X%s", data[i], (i + 1 < length) ? " " : "");
-    out += tmp;
-  }
-  return out;
-}
-
 }  // namespace
 
 const char *unlock_method_name(UnlockMethod method) {
@@ -111,14 +90,11 @@ class SwitchbotKeypadBridge::ServerCallbacks : public NimBLEServerCallbacks {
   explicit ServerCallbacks(SwitchbotKeypadBridge *parent) : parent_(parent) {}
 
   void onConnect(NimBLEServer *server, NimBLEConnInfo &info) override {
-    ESP_LOGI(TAG, "Keypad connected: %s", info.getAddress().toString().c_str());
-    this->parent_->reset_session_state_();
+    this->parent_->push_connect_();
   }
 
   void onDisconnect(NimBLEServer *server, NimBLEConnInfo &info, int reason) override {
-    ESP_LOGI(TAG, "Keypad disconnected (reason=0x%02X), restarting advertising", reason);
-    this->parent_->reset_session_state_();
-    NimBLEDevice::startAdvertising();
+    this->parent_->push_disconnect_();
   }
 
  private:
@@ -133,7 +109,7 @@ class SwitchbotKeypadBridge::RxCharCallbacks : public NimBLECharacteristicCallba
     const std::string value = characteristic->getValue();
     if (value.empty())
       return;
-    this->parent_->on_rx_frame_(value);
+    this->parent_->push_rx_(value);
   }
 
  private:
@@ -141,27 +117,216 @@ class SwitchbotKeypadBridge::RxCharCallbacks : public NimBLECharacteristicCallba
 };
 
 // ---------------------------------------------------------------------------
+// Thread-safe event queueing
+// ---------------------------------------------------------------------------
+
+void SwitchbotKeypadBridge::push_connect_() {
+  std::lock_guard<std::mutex> lk(this->rx_mutex_);
+  this->rx_queue_.push_back({QueuedEvent::CONNECT, ""});
+}
+
+void SwitchbotKeypadBridge::push_disconnect_() {
+  std::lock_guard<std::mutex> lk(this->rx_mutex_);
+  this->rx_queue_.push_back({QueuedEvent::DISCONNECT, ""});
+}
+
+void SwitchbotKeypadBridge::push_rx_(const std::string &frame) {
+  std::lock_guard<std::mutex> lk(this->rx_mutex_);
+  this->rx_queue_.push_back({QueuedEvent::RX, frame});
+}
+
+// ---------------------------------------------------------------------------
 // Component lifecycle
 // ---------------------------------------------------------------------------
 
 void SwitchbotKeypadBridge::setup() {
+  // Load — or, on first boot, generate — the 16-byte AES-128 session key.
+  // unpair() rotates it; it is never part of the YAML config.
+  this->shared_key_pref_ =
+      global_preferences->make_preference<std::array<uint8_t, 16>>(0x534B4559UL /* 'SKEY' */);
+  if (!this->shared_key_pref_.load(&this->shared_key_)) {
+    this->create_shared_key_();
+    ESP_LOGI(TAG, "Generated a fresh shared key");
+  }
+
+  // Restore the paired keypad name (if any) and publish it to the sensor.
+  this->keypad_name_pref_ = global_preferences->make_preference<char[KEYPAD_NAME_MAX]>(
+      0x534B5042UL /* 'SKPB' */);
+  char stored_name[KEYPAD_NAME_MAX] = {};
+  bool have_keypad = false;
+  if (this->keypad_name_pref_.load(&stored_name) && stored_name[0] != '\0') {
+    stored_name[KEYPAD_NAME_MAX - 1] = '\0';
+    have_keypad = true;
+    if (this->keypad_text_sensor_ != nullptr) {
+      this->keypad_text_sensor_->publish_state(stored_name);
+    }
+    ESP_LOGI(TAG, "Paired keypad: '%s'", stored_name);
+  } else {
+    if (this->keypad_text_sensor_ != nullptr) {
+      this->keypad_text_sensor_->publish_state("Unpaired");
+    }
+  }
+
   if (!this->prepare_keys_() || !this->prepare_ble_()) {
     this->mark_failed();
     return;
   }
-  const std::string ble_address = NimBLEDevice::getAddress().toString();
-  if (this->ble_mac_text_sensor_ != nullptr) {
-    this->ble_mac_text_sensor_->publish_state(ble_address);
+  ESP_LOGI(TAG, "Ready. Advertising on %s",
+           NimBLEDevice::getAddress().toString().c_str());
+
+  if (this->pairing_ui_enabled_) {
+    this->pairing_ui_.set_shared_key(this->shared_key_);
+    this->pairing_ui_.set_on_paired_callback([this](const std::string &name) {
+      // Runs on the HTTP-server task — keep it minimal: stash the name and
+      // raise a flag. loop() (the main task) publishes the text sensor,
+      // writes NVS and stops the server.
+      this->pending_keypad_name_ = name;
+      this->pending_pair_apply_.store(true, std::memory_order_release);
+    });
+    // Pairing mode: with no keypad paired yet, open the wizard right away
+    // so the very first pairing needs no button press.
+    if (!have_keypad) {
+      if (this->pairing_ui_.start()) {
+        ESP_LOGI(TAG, "No keypad paired — pairing mode active on http://<device>/");
+      } else {
+        ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
+      }
+    }
   }
-  ESP_LOGI(TAG, "Ready. Advertising on %s", ble_address.c_str());
+}
+
+void SwitchbotKeypadBridge::loop() {
+  // Apply a pairing that completed on the HTTP-server task. The text-sensor
+  // publish and the NVS write run here, on the main task.
+  if (this->pending_pair_apply_.exchange(false, std::memory_order_acquire)) {
+    const std::string &name = this->pending_keypad_name_;
+
+    // Persist the name so it survives a reboot and can be re-published.
+    char buf[KEYPAD_NAME_MAX] = {};
+    name.copy(buf, sizeof(buf) - 1);
+    const bool saved = this->keypad_name_pref_.save(&buf);
+    global_preferences->sync();
+
+    if (this->keypad_text_sensor_ != nullptr) {
+      this->keypad_text_sensor_->publish_state(name);
+    }
+    ESP_LOGI(TAG, "Paired keypad: '%s' (nvs save %s)", name.c_str(),
+             saved ? "ok" : "FAILED");
+
+    // Pairing done — close the wizard server. Defer ~2 s so the wizard's
+    // final status poll still gets its reply. set_timeout() is safe here:
+    // loop() runs on the main task.
+    this->set_timeout(2000, [this]() {
+      this->pairing_ui_.stop();
+      ESP_LOGI(TAG, "Pairing UI stopped — pairing complete");
+    });
+  }
+
+  // Drain the RX queue. Doing a copy and clear limits memory allocation
+  // in the NimBLE thread side to the bare minimum, avoiding heap thrashing.
+  std::vector<QueuedEvent> pending;
+  {
+    std::lock_guard<std::mutex> lk(this->rx_mutex_);
+    if (!this->rx_queue_.empty()) {
+      pending = this->rx_queue_;
+      this->rx_queue_.clear();
+    }
+  }
+
+  for (const auto &ev : pending) {
+    if (ev.type == QueuedEvent::CONNECT) {
+      ESP_LOGI(TAG, "Keypad connected");
+      this->reset_session_state_();
+    } else if (ev.type == QueuedEvent::DISCONNECT) {
+      ESP_LOGI(TAG, "Keypad disconnected, restarting advertising");
+      this->reset_session_state_();
+      NimBLEDevice::startAdvertising();
+    } else if (ev.type == QueuedEvent::RX) {
+      this->on_rx_frame_(ev.frame);
+    }
+  }
+}
+
+void SwitchbotKeypadBridge::unpair() {
+  ESP_LOGI(TAG, "Unpairing — rotating the shared key and re-opening the pairing wizard");
+
+  // Rotate the key and swap it into the live crypto slot: the previously
+  // paired keypad can no longer command the bridge, with no reboot needed.
+  this->create_shared_key_();
+  if (!this->import_aes_key_()) {
+    ESP_LOGE(TAG, "Key rotation failed — unpair aborted");
+    return;
+  }
+
+  // Forget the paired keypad name.
+  char empty[KEYPAD_NAME_MAX] = {};
+  this->keypad_name_pref_.save(&empty);
+  global_preferences->sync();
+  if (this->keypad_text_sensor_ != nullptr) {
+    this->keypad_text_sensor_->publish_state("Unpaired");
+  }
+
+  // Invalidate any in-flight BLE session — it is keyed to the old secret.
+  this->reset_session_state_();
+  this->shared_slot_id_ = 0x00;
+
+  // Re-enter pairing mode straight away with the rotated key.
+  if (this->pairing_ui_enabled_) {
+    this->pairing_ui_.set_shared_key(this->shared_key_);
+    if (this->pairing_ui_.start()) {
+      ESP_LOGI(TAG, "Unpaired — pairing mode active on http://<device>/");
+    } else {
+      ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
+    }
+  }
+}
+
+void UnpairButton::press_action() {
+  if (this->parent_->is_pairing_active()) {
+    ESP_LOGW(TAG, "Pairing is already active, ignoring Unpair action");
+    return;
+  }
+  this->parent_->unpair();
 }
 
 void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "SwitchBot Keypad Bridge:");
   ESP_LOGCONFIG(TAG, "  BLE address: %s", NimBLEDevice::getAddress().toString().c_str());
+  ESP_LOGCONFIG(TAG, "  Pairing UI: %s",
+                this->pairing_ui_enabled_ ? "enabled (port 80)" : "disabled");
   if (this->is_failed()) {
     ESP_LOGE(TAG, "  Initialization failed - see previous errors");
   }
+}
+
+void SwitchbotKeypadBridge::create_shared_key_() {
+  esp_fill_random(this->shared_key_.data(), this->shared_key_.size());
+  this->shared_key_pref_.save(&this->shared_key_);
+  global_preferences->sync();
+}
+
+bool SwitchbotKeypadBridge::import_aes_key_() {
+  // Drop any previously imported handle so the slot can be re-keyed in
+  // place — unpair() rotates the key without rebooting.
+  if (this->aes_key_handle_ != PSA_KEY_ID_NULL) {
+    psa_destroy_key(this->aes_key_handle_);
+    this->aes_key_handle_ = PSA_KEY_ID_NULL;
+  }
+
+  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
+  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
+  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
+  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
+  psa_set_key_bits(&attrs, 128);
+  psa_status_t status = psa_import_key(&attrs, this->shared_key_.data(), AES_KEY_SIZE,
+                                       &this->aes_key_handle_);
+  psa_reset_key_attributes(&attrs);
+
+  if (status != PSA_SUCCESS) {
+    ESP_LOGE(TAG, "AES key import failed (%d)", static_cast<int>(status));
+    return false;
+  }
+  return true;
 }
 
 bool SwitchbotKeypadBridge::prepare_keys_() {
@@ -170,29 +335,7 @@ bool SwitchbotKeypadBridge::prepare_keys_() {
     ESP_LOGE(TAG, "PSA Crypto init failed (%d)", static_cast<int>(status));
     return false;
   }
-
-  uint8_t key_bytes[AES_KEY_SIZE];
-  if (!parse_hex(this->shared_key_hex_, key_bytes, AES_KEY_SIZE)) {
-    ESP_LOGE(TAG, "Invalid shared_key: expected 32 hexadecimal characters");
-    return false;
-  }
-
-  psa_key_attributes_t attrs = PSA_KEY_ATTRIBUTES_INIT;
-  psa_set_key_usage_flags(&attrs, PSA_KEY_USAGE_ENCRYPT);
-  psa_set_key_algorithm(&attrs, PSA_ALG_CTR);
-  psa_set_key_type(&attrs, PSA_KEY_TYPE_AES);
-  psa_set_key_bits(&attrs, 128);
-  status = psa_import_key(&attrs, key_bytes, AES_KEY_SIZE, &this->aes_key_handle_);
-  psa_reset_key_attributes(&attrs);
-  // The PSA implementation now owns the key material — wipe the local copy
-  // so it does not linger on the stack.
-  std::memset(key_bytes, 0, sizeof(key_bytes));
-
-  if (status != PSA_SUCCESS) {
-    ESP_LOGE(TAG, "AES key import failed (%d)", static_cast<int>(status));
-    return false;
-  }
-  return true;
+  return this->import_aes_key_();
 }
 
 bool SwitchbotKeypadBridge::prepare_ble_() {
@@ -518,7 +661,7 @@ void SwitchbotKeypadBridge::record_ciphertext_(const uint8_t *ciphertext, size_t
 
 void SwitchbotKeypadBridge::publish_lock_() {
   if (this->keypad_event_ != nullptr) {
-    this->keypad_event_->trigger("lock");
+    this->keypad_event_->trigger("Lock");
   }
   this->on_lock_callbacks_.call();
 }
@@ -526,7 +669,7 @@ void SwitchbotKeypadBridge::publish_lock_() {
 void SwitchbotKeypadBridge::publish_unlock_(UnlockMethod method, int index) {
   const char *method_str = unlock_method_name(method);
   if (this->keypad_event_ != nullptr) {
-    this->keypad_event_->trigger("unlock");
+    this->keypad_event_->trigger("Unlock");
   }
   this->on_unlock_callbacks_.call(std::string(method_str), index);
 }

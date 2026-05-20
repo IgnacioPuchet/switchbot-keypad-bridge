@@ -4,16 +4,23 @@
 #include <psa/crypto.h>
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <mutex>
+#include <vector>
 
+#include "esphome/components/button/button.h"
 #include "esphome/components/event/event.h"
 #include "esphome/components/text_sensor/text_sensor.h"
 #include "esphome/core/automation.h"
 #include "esphome/core/component.h"
 #include "esphome/core/defines.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
+
+#include "pairing_ui.h"
 
 // NimBLE's log_common.h defines LOG_LEVEL_* as plain macros, which collide
 // with identically-named members of ESPHome enums included downstream.
@@ -28,6 +35,9 @@
 namespace esphome {
 namespace switchbot_keypad_bridge {
 
+// Upper bound (including the trailing NUL) on the persisted keypad name.
+constexpr size_t KEYPAD_NAME_MAX = 48;
+
 enum class UnlockMethod : uint8_t {
   UNKNOWN = 0x00,
   PIN = 0x04,
@@ -38,15 +48,25 @@ enum class UnlockMethod : uint8_t {
 const char *unlock_method_name(UnlockMethod method);
 
 class SwitchbotKeypadBridge : public Component {
-  SUB_TEXT_SENSOR(ble_mac)
+  SUB_TEXT_SENSOR(keypad)
 
  public:
   void setup() override;
+  void loop() override;
   void dump_config() override;
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
-  void set_shared_key(const std::string &key) { this->shared_key_hex_ = key; }
   void set_keypad_event(event::Event *ev) { this->keypad_event_ = ev; }
+  void set_pairing_ui_enabled(bool enabled) { this->pairing_ui_enabled_ = enabled; }
+  void set_pairing_ui_html(const uint8_t *html, size_t len) {
+    this->pairing_ui_.set_html(html, len);
+  }
+
+  bool is_pairing_active() const { return this->pairing_ui_.is_running(); }
+
+  // Forgets the paired keypad, rotates the shared key in place and
+  // re-opens the pairing wizard — no reboot. Invoked by UnpairButton.
+  void unpair();
 
   void add_on_lock_callback(std::function<void()> &&callback) {
     this->on_lock_callbacks_.add(std::move(callback));
@@ -87,6 +107,13 @@ class SwitchbotKeypadBridge : public Component {
   };
 
   // ----- Configuration / setup -----------------------------------------------
+
+  // Generates a fresh AES-128 session key into shared_key_ and persists it
+  // to NVS — the one place keys are created (first boot and unpair()).
+  void create_shared_key_();
+  // (Re-)imports shared_key_ into the PSA crypto slot, replacing any handle
+  // imported earlier. Lets unpair() re-key the live session without a reboot.
+  bool import_aes_key_();
 
   bool prepare_keys_();
   bool prepare_ble_();
@@ -129,6 +156,33 @@ class SwitchbotKeypadBridge : public Component {
   NimBLEServer *server_{nullptr};
   NimBLECharacteristic *tx_characteristic_{nullptr};
 
+  // ----- Thread-safe event queueing from NimBLE callbacks --------------------
+
+  struct QueuedEvent {
+    enum Type { CONNECT, DISCONNECT, RX } type;
+    std::string frame;
+  };
+
+  std::mutex rx_mutex_;
+  std::vector<QueuedEvent> rx_queue_;
+
+  void push_connect_();
+  void push_disconnect_();
+  void push_rx_(const std::string &frame);
+
+  // ----- On-device pairing wizard --------------------------------------------
+
+  bool pairing_ui_enabled_{false};
+  PairingUi pairing_ui_{};
+
+  // A finished pairing is signalled from the HTTP-server task; loop() (the
+  // main task) consumes it and publishes the keypad name + writes NVS, so
+  // neither runs on the network task. pending_keypad_name_ is written
+  // before the flag is set — the release/acquire pair makes it safe to
+  // read once the flag is observed.
+  std::atomic<bool> pending_pair_apply_{false};
+  std::string pending_keypad_name_;
+
   // ----- ESPHome wiring ------------------------------------------------------
 
   event::Event *keypad_event_{nullptr};
@@ -137,7 +191,11 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- User configuration --------------------------------------------------
 
-  std::string shared_key_hex_;
+  // 16-byte AES-128 session key. Generated on first boot, persisted in
+  // NVS, rotated by unpair(). Never part of the YAML config.
+  std::array<uint8_t, 16> shared_key_{};
+  ESPPreferenceObject shared_key_pref_;
+  ESPPreferenceObject keypad_name_pref_;
   // Token-slot key_id the keypad uses post-pairing. Auto-learned from the
   // IV-request frame the keypad sends as the first message of every session
   // (Original/Touch=0x88, Vision/Vision Pro=0xC6, …). 0x00 = not yet seen;
@@ -166,6 +224,13 @@ class SwitchbotKeypadBridge : public Component {
   std::array<ReplayEntry, REPLAY_HISTORY_SIZE> replay_history_{};
   size_t replay_head_{0};
   bool iv_established_{false};
+};
+
+// Home Assistant button that unpairs the keypad: forgets it, rotates the
+// shared key and re-opens the pairing wizard — all without a reboot.
+class UnpairButton : public button::Button, public Parented<SwitchbotKeypadBridge> {
+ protected:
+  void press_action() override;
 };
 
 }  // namespace switchbot_keypad_bridge

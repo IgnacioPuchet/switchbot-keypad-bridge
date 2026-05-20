@@ -2,7 +2,7 @@ esphome:
   name: switchbot-keypad-bridge
 
 esp32:
-  variant: esp32
+  variant: esp32s3
   framework:
     type: esp-idf
 
@@ -23,37 +23,24 @@ ota:
     password: !secret ota_password
 
 switchbot_keypad_bridge:
-  shared_key: !secret switchbot_shared_key
+  pairing_ui: true
 
-  # Standard ESPHome event entity. Surfaces in Home Assistant as
-  # `event.<device>_keypad` with `lock` / `unlock` event types.
+  keypad_action:
+    name: "Action"
+
   keypad:
     name: "Keypad"
 
-  # Diagnostic text sensor exposing the BLE peripheral address (the one the
-  # keypad must be paired against — it differs by +2 from the Wi-Fi MAC HA
-  # shows on the device card).
-  ble_mac:
-    name: "BLE MAC"
+  unpair_button:
+    name: "Unpair"
 
-  # Triggered when the keypad sends a "lock" command.
   # on_lock:
-  #   - logger.log: "Keypad: lock"
+  #   - logger.log: "Locked"
 
-  # Triggered when the keypad sends an "unlock" command.
-  # Two lambdas are in scope: `method` (std::string: "pin", "fingerprint",
-  # "face", or "unknown") and `index` (int: credential slot).
   on_unlock:
-    # Forward to Home Assistant as a custom event with the rich payload.
+    # method: "pin" | "fingerprint" | "face" | "unknown"   index: credential slot
     - homeassistant.event:
         event: esphome.switchbot_keypad_unlock
         data:
           method: !lambda 'return method;'
           index: !lambda 'return to_string(index);'
-
-    # Or branch on method / index directly with `if:` actions.
-    # - if:
-    #     condition:
-    #       lambda: 'return method == "fingerprint" && index == 0;'
-    #     then:
-    #       - logger.log: "Welcome home, owner"

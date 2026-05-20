@@ -1,0 +1,902 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>SwitchBot Keypad Bridge</title>
+<style>
+  /* SwitchBot brand palette extracted from the official app's colors.xml */
+  :root {
+    --sb-theme:        #e0393a;
+    --sb-theme-press:  #c52f30;
+    --sb-blue:         #447eef;
+
+    --sb-window-bg:    #f5f5f7;
+    --sb-card-bg:      #ffffff;
+    --sb-primary-text: #1c1c1e;
+    --sb-cc2:          #6c717c;
+    --sb-support:      #9ca1a4;
+    --sb-divider:      rgba(0,0,0,0.08);
+    --sb-shadow:       0 1px 3px rgba(0,0,0,0.05), 0 4px 16px rgba(0,0,0,0.06);
+    --sb-blue-tip-bg:  #ecf2fd;
+    --sb-alert-bg:     #fbebeb;
+    --sb-success-bg:   #e8f5ec;
+    --sb-success:      #2e9c4d;
+    --sb-kp-icon-bg:   linear-gradient(135deg, #ffe4e4 0%, #fdd6d7 100%);
+
+    --radius-card:   16px;
+    --radius-input:  12px;
+    --radius-btn:    12px;
+    --sp-xs:  4px;
+    --sp-sm:  8px;
+    --sp-md:  16px;
+    --sp-lg:  24px;
+    --sp-xl:  32px;
+    --sp-2xl: 48px;
+  }
+
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --sb-window-bg:    #111925;
+      --sb-card-bg:      #1e2a38;
+      --sb-primary-text: #dadddf;
+      --sb-cc2:          #b5bcc0;
+      --sb-support:      #6c717c;
+      --sb-divider:      rgba(255,255,255,0.09);
+      --sb-shadow:       0 2px 8px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.3);
+      --sb-blue-tip-bg:  #102f64;
+      --sb-alert-bg:     #3a2020;
+      --sb-success-bg:   #1a3327;
+      --sb-success:      #4dbf72;
+      --sb-kp-icon-bg:   linear-gradient(135deg, #4b2a2a 0%, #5b3040 100%);
+    }
+  }
+  :root[data-theme="dark"] {
+    --sb-window-bg:    #111925;
+    --sb-card-bg:      #1e2a38;
+    --sb-primary-text: #dadddf;
+    --sb-cc2:          #b5bcc0;
+    --sb-support:      #6c717c;
+    --sb-divider:      rgba(255,255,255,0.09);
+    --sb-shadow:       0 2px 8px rgba(0,0,0,0.4), 0 8px 24px rgba(0,0,0,0.3);
+    --sb-blue-tip-bg:  #102f64;
+    --sb-alert-bg:     #3a2020;
+    --sb-success-bg:   #1a3327;
+    --sb-success:      #4dbf72;
+    --sb-kp-icon-bg:   linear-gradient(135deg, #4b2a2a 0%, #5b3040 100%);
+  }
+
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    background: var(--sb-window-bg);
+    color: var(--sb-primary-text);
+    min-height: 100vh;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+
+  /* ── Top bar ── */
+  .topbar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 0 20px;
+    height: 52px;
+    background: var(--sb-card-bg);
+    border-bottom: 1px solid var(--sb-divider);
+    position: sticky; top: 0; z-index: 10;
+  }
+  .topbar-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--sb-theme); flex-shrink: 0;
+  }
+  .topbar-title { font-weight: 600; font-size: 14px; color: var(--sb-cc2); }
+
+  /* ── Page container ── */
+  .container {
+    max-width: 440px;
+    margin: 0 auto;
+    padding: var(--sp-xl) var(--sp-md) var(--sp-2xl);
+  }
+
+  /* ── Screen transitions ── */
+  .screen { animation: fadein 200ms ease; }
+  .hidden { display: none !important; }
+  @keyframes fadein {
+    from { opacity: 0; transform: translateY(6px); }
+    to   { opacity: 1; transform: translateY(0); }
+  }
+
+  /* ── Login hero ── */
+  .hero {
+    text-align: center;
+    padding: var(--sp-md) 0 var(--sp-xl);
+  }
+  .hero-logo {
+    display: inline-flex;
+    margin-bottom: var(--sp-lg);
+    filter: drop-shadow(0 6px 20px rgba(224,57,58,0.22));
+  }
+  .hero-logo img { width: 80px; height: 80px; display: block; }
+  .hero h1 {
+    font-size: 26px; font-weight: 700;
+    letter-spacing: -0.5px; line-height: 1.2;
+    margin: 0 0 var(--sp-sm);
+  }
+  .hero .subtitle {
+    color: var(--sb-cc2); font-size: 14px;
+    margin: 0 auto; max-width: 280px; line-height: 1.5;
+  }
+
+  /* ── Card shell ── */
+  .card {
+    background: var(--sb-card-bg);
+    border-radius: var(--radius-card);
+    box-shadow: var(--sb-shadow);
+    border: 1px solid var(--sb-divider);
+    padding: var(--sp-lg);
+  }
+
+  /* ── Form fields ── */
+  .form-group { margin-bottom: var(--sp-md); }
+  .form-group label {
+    display: block;
+    font-size: 11px; font-weight: 700;
+    color: var(--sb-support);
+    text-transform: uppercase;
+    letter-spacing: 0.7px;
+    margin-bottom: var(--sp-sm);
+  }
+  .form-group input {
+    width: 100%;
+    padding: 14px 16px;
+    border: 1.5px solid var(--sb-divider);
+    border-radius: var(--radius-input);
+    background: var(--sb-card-bg);
+    font: inherit;
+    font-size: 16px; /* 16px prevents iOS auto-zoom on focus */
+    color: var(--sb-primary-text);
+    transition: border-color 150ms, box-shadow 150ms;
+    -webkit-appearance: none; appearance: none;
+  }
+  .form-group input:focus {
+    outline: none;
+    border-color: var(--sb-theme);
+    box-shadow: 0 0 0 3px rgba(224,57,58,0.12);
+  }
+  .form-group input::placeholder { color: var(--sb-support); }
+
+  /* ── Buttons ── */
+  .btn {
+    display: block; width: 100%;
+    border: none; border-radius: var(--radius-btn);
+    padding: 15px 20px;
+    font: inherit; font-size: 15px; font-weight: 600;
+    cursor: pointer; text-align: center;
+    transition: background 150ms, transform 80ms, box-shadow 150ms;
+    -webkit-tap-highlight-color: transparent;
+    user-select: none;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+
+  .btn-primary {
+    background: var(--sb-theme); color: #fff;
+    box-shadow: 0 4px 14px rgba(224,57,58,0.28);
+  }
+  .btn-primary:hover:not(:disabled) {
+    background: var(--sb-theme-press);
+    box-shadow: 0 6px 18px rgba(224,57,58,0.34);
+  }
+  .btn-secondary {
+    background: var(--sb-card-bg); color: var(--sb-primary-text);
+    border: 1.5px solid var(--sb-divider); box-shadow: none;
+  }
+  .btn-secondary:hover:not(:disabled) { background: var(--sb-window-bg); }
+
+  .btn-pair {
+    border: none; background: var(--sb-theme); color: #fff;
+    padding: 9px 18px; border-radius: 999px;
+    font: inherit; font-weight: 600; font-size: 13px;
+    cursor: pointer; flex-shrink: 0; white-space: nowrap;
+    transition: background 150ms, transform 80ms;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .btn-pair:hover:not(:disabled) { background: var(--sb-theme-press); }
+  .btn-pair:active { transform: scale(0.95); }
+  .btn-pair:disabled { background: var(--sb-support); cursor: not-allowed; opacity: 0.55; }
+
+  /* ── Page header ── */
+  .page-header { margin-bottom: var(--sp-lg); }
+  .page-header h2 {
+    font-size: 22px; font-weight: 700;
+    letter-spacing: -0.3px; line-height: 1.2;
+    margin: 0 0 4px;
+  }
+  .page-header .subtitle { color: var(--sb-cc2); font-size: 14px; margin: 0; }
+
+  /* ── Keypad cards ── */
+  .keypads-list {
+    display: flex; flex-direction: column; gap: var(--sp-sm);
+    margin-bottom: var(--sp-md);
+  }
+  .kp-card {
+    display: flex; align-items: center; gap: var(--sp-md);
+    background: var(--sb-card-bg);
+    border-radius: var(--radius-card);
+    padding: var(--sp-md);
+    box-shadow: var(--sb-shadow);
+    border: 1px solid var(--sb-divider);
+    transition: border-color 150ms;
+  }
+  .kp-card.online:hover { border-color: rgba(224,57,58,0.22); }
+  .kp-icon {
+    width: 48px; height: 48px; border-radius: 14px;
+    background: var(--sb-kp-icon-bg);
+    color: var(--sb-theme);
+    display: flex; align-items: center; justify-content: center;
+    flex-shrink: 0;
+  }
+  .kp-icon.dim { background: var(--sb-divider); color: var(--sb-support); }
+  .kp-icon svg { width: 24px; height: 24px; }
+  .kp-info { flex: 1; min-width: 0; }
+  .kp-name {
+    font-weight: 600; font-size: 15px;
+    margin-bottom: 4px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .kp-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .kp-mac {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px; color: var(--sb-support);
+  }
+  .kp-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    border-radius: 999px; padding: 2px 8px;
+    font-size: 11px; font-weight: 500;
+  }
+  .kp-badge .dot { width: 5px; height: 5px; border-radius: 50%; }
+  .kp-badge.online  { background: rgba(46,156,77,0.12); color: var(--sb-success); }
+  .kp-badge.online .dot  { background: var(--sb-success); }
+  .kp-badge.offline { background: var(--sb-divider); color: var(--sb-support); }
+  .kp-badge.offline .dot { background: var(--sb-support); }
+
+  /* ── Empty state ── */
+  .empty-state {
+    text-align: center;
+    padding: var(--sp-2xl) var(--sp-lg);
+    color: var(--sb-support); font-size: 14px;
+    background: var(--sb-card-bg);
+    border-radius: var(--radius-card);
+    border: 1.5px dashed var(--sb-divider);
+  }
+  /* Spinner shown while /api/keypads runs (cloud call + ~4 s BLE scan). */
+  .spinner {
+    width: 30px; height: 30px;
+    margin: 0 auto var(--sp-md);
+    border: 3px solid var(--sb-divider);
+    border-top-color: var(--sb-theme);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+  }
+
+  /* ── Progress screen ── */
+  .progress-header { margin-bottom: var(--sp-md); }
+  .progress-header h2 {
+    font-size: 22px; font-weight: 700;
+    letter-spacing: -0.3px; line-height: 1.2; margin: 0 0 4px;
+  }
+  .progress-header .target {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px; color: var(--sb-support); margin: 0;
+  }
+
+  /* Thin progress bar */
+  .progress-track {
+    height: 3px;
+    background: var(--sb-divider);
+    border-radius: 2px;
+    margin-bottom: var(--sp-lg);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--sb-theme);
+    border-radius: 2px;
+    transition: width 400ms ease;
+    width: 0%;
+  }
+
+  /* ── Stepper ── */
+  .stepper {
+    list-style: none; padding: 0; margin: 0;
+    position: relative;
+  }
+  /* Vertical connecting line behind all indicators */
+  .stepper::before {
+    content: '';
+    position: absolute;
+    left: 9px; top: 20px; bottom: 20px;
+    width: 2px;
+    background: var(--sb-divider);
+    border-radius: 1px;
+  }
+  .step {
+    display: flex; align-items: center; gap: 14px;
+    padding: 9px 0;
+    font-size: 14px; color: var(--sb-support);
+    position: relative;
+  }
+  .step .indicator {
+    width: 20px; height: 20px; border-radius: 50%;
+    border: 2px solid var(--sb-divider);
+    flex-shrink: 0;
+    background: var(--sb-card-bg); /* covers the track line */
+    position: relative; z-index: 1;
+    transition: border-color 200ms, background 200ms;
+  }
+  .step.done .indicator {
+    background: var(--sb-success);
+    border-color: var(--sb-success);
+  }
+  .step.done .indicator::after {
+    content: '';
+    position: absolute; inset: 0;
+    background: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none'%3E%3Cpath d='M5 10.5l3.5 3.5 6.5-7' stroke='white' stroke-width='2.2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center / 13px no-repeat;
+  }
+  .step.done { color: var(--sb-primary-text); }
+  .step.active { color: var(--sb-primary-text); font-weight: 500; }
+  .step.active .indicator {
+    border-color: var(--sb-theme);
+    border-top-color: transparent;
+    background: var(--sb-card-bg);
+    animation: spin 0.75s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Banners ── */
+  .banner {
+    border-radius: var(--radius-input);
+    padding: 12px 14px;
+    font-size: 13px; line-height: 1.5;
+    display: flex; align-items: flex-start; gap: 10px;
+  }
+  .banner .icon {
+    flex-shrink: 0; width: 18px; height: 18px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 700; color: white;
+  }
+  .banner-error  { background: var(--sb-alert-bg);    color: var(--sb-theme);   }
+  .banner-error .icon  { background: var(--sb-theme); }
+
+  /* ── Result screens (rendered in place of the stepper, inside the card) ── */
+  .result-hero {
+    text-align: center;
+    padding: var(--sp-sm) 0 var(--sp-lg);
+  }
+  .result-icon {
+    width: 88px; height: 88px; border-radius: 50%;
+    display: inline-flex; align-items: center; justify-content: center;
+    margin-bottom: var(--sp-lg);
+  }
+  .result-icon svg { width: 40px; height: 40px; }
+  .result-hero.success .result-icon {
+    background: var(--sb-success-bg);
+    box-shadow: 0 0 0 10px rgba(46,156,77,0.08), 0 12px 32px rgba(46,156,77,0.20);
+  }
+  .result-hero.success .result-icon svg { stroke: var(--sb-success); }
+  .result-hero.error .result-icon {
+    background: var(--sb-alert-bg);
+    box-shadow: 0 0 0 10px rgba(224,57,58,0.08), 0 12px 32px rgba(224,57,58,0.20);
+  }
+  .result-hero.error .result-icon svg { stroke: var(--sb-theme); }
+  .result-hero h2 {
+    font-size: 26px; font-weight: 700;
+    letter-spacing: -0.4px; line-height: 1.2;
+    margin: 0 0 var(--sp-sm);
+  }
+  .result-hero .desc { color: var(--sb-cc2); font-size: 14px; margin: 0; }
+  /* Retry button, below the error banner inside the card */
+  #progress-result-error .btn { margin-top: var(--sp-lg); }
+
+  /* Device name pill shown on success */
+  .device-pill {
+    display: inline-flex; align-items: center; gap: 8px;
+    background: var(--sb-card-bg);
+    border: 1px solid var(--sb-divider);
+    border-radius: 999px;
+    padding: 8px 16px;
+    margin-top: var(--sp-md);
+    font-size: 14px; font-weight: 500;
+    box-shadow: var(--sb-shadow);
+  }
+  .device-pill .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--sb-success); flex-shrink: 0;
+  }
+
+  /* ── Footnote ── */
+  .footnote {
+    text-align: center; color: var(--sb-support);
+    font-size: 12px; line-height: 1.6;
+    margin-top: var(--sp-lg);
+  }
+
+  /* ── Developer nav — hidden unless opened as a local file ── */
+  /* An author rule is needed: the bare `hidden` attribute would lose to
+     the `display: flex` below (author rules outrank the UA stylesheet). */
+  .preview-nav[hidden] { display: none; }
+  .preview-nav {
+    background: #1a1d24; color: #fff;
+    padding: 10px 16px; font-size: 12px;
+    display: flex; align-items: center; justify-content: space-between;
+    flex-wrap: wrap; gap: 8px;
+  }
+  .preview-nav strong { color: #ff7e80; }
+  .preview-nav button {
+    background: rgba(255,255,255,0.10); color: #fff;
+    border: 1px solid rgba(255,255,255,0.18);
+    padding: 5px 10px; border-radius: 6px;
+    font: inherit; font-size: 12px; cursor: pointer;
+  }
+  .preview-nav button:hover { background: rgba(255,255,255,0.18); }
+  .preview-nav button.active { background: var(--sb-theme); border-color: var(--sb-theme); }
+</style>
+</head>
+<body>
+
+<!-- Developer navigation bar. Hidden by default; the script below reveals
+     it only when this file is opened directly in a browser (file://).
+     When served by the device over HTTP it stays hidden, so the firmware
+     can embed this page verbatim — no build step strips anything. -->
+<div class="preview-nav" id="preview-nav" hidden>
+  <span>🛠 <strong>UI preview</strong> — not part of the firmware</span>
+  <span>
+    <button onclick="showScreen('login')" class="active">Login</button>
+    <button onclick="showScreen('keypads')">Keypad list</button>
+    <button onclick="showScreen('progress'); previewProgress()">Pairing (Progress)</button>
+    <button onclick="showScreen('progress'); showResultSuccess()">Success</button>
+    <button onclick="showScreen('progress'); showResultError('Simulated error message.')">Error</button>
+    <button onclick="toggleTheme()" id="theme-toggle" style="margin-left:8px;">🌙 Dark</button>
+  </span>
+</div>
+
+<header class="topbar">
+  <div class="topbar-dot"></div>
+  <span class="topbar-title">Keypad Bridge</span>
+</header>
+
+<main class="container">
+
+  <!-- ─── Login ─── -->
+  <section id="screen-login" class="screen">
+    <div class="hero">
+      <div class="hero-logo">
+        <img
+          src="data:image/webp;base64,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"
+          alt="SwitchBot" width="80" height="80">
+      </div>
+      <h1>Sign in</h1>
+      <p class="subtitle">Connect your SwitchBot account to discover keypads.</p>
+    </div>
+
+    <form id="login-form">
+      <div class="form-group">
+        <label for="email">Email</label>
+        <input type="email" id="email" name="email" autocomplete="username"
+               placeholder="you@example.com" required>
+      </div>
+      <div class="form-group" style="margin-bottom:var(--sp-lg);">
+        <label for="password">Password</label>
+        <input type="password" id="password" name="password" autocomplete="current-password"
+               placeholder="••••••••" required>
+      </div>
+      <button type="submit" class="btn btn-primary">Continue</button>
+    </form>
+
+    <div id="login-error" class="banner banner-error" style="display:none;margin-top:var(--sp-md);">
+      <span class="icon">!</span>
+      <span id="login-error-text"></span>
+    </div>
+
+    <p class="footnote">
+      Credentials are used only to call the SwitchBot API<br>
+      and are kept in device RAM for this session only.
+    </p>
+  </section>
+
+  <!-- ─── Keypad list ─── -->
+  <section id="screen-keypads" class="screen hidden">
+    <div class="page-header">
+      <h2>Your keypads</h2>
+      <p class="subtitle">Select a keypad to pair with this bridge.</p>
+    </div>
+
+    <div class="keypads-list" id="keypads-list">
+      <!-- example cards (will be replaced by JS in the firmware) -->
+      <div class="kp-card online">
+        <div class="kp-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="3" width="16" height="18" rx="2.5"/>
+            <circle cx="8"  cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="12" cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="16" cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="8"  cy="13" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="12" cy="13" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="16" cy="13" r="1" fill="currentColor" stroke="none"/>
+            <rect x="7" y="16.5" width="10" height="1.5" rx="0.75" fill="currentColor" stroke="none"/>
+          </svg>
+        </div>
+        <div class="kp-info">
+          <div class="kp-name">Keypad Vision 75</div>
+          <div class="kp-meta">
+            <span class="kp-mac">B0:E9:FE:61:2E:75</span>
+            <span class="kp-badge online"><span class="dot"></span>−42 dBm</span>
+          </div>
+        </div>
+        <button class="btn-pair">Pair</button>
+      </div>
+
+      <div class="kp-card">
+        <div class="kp-icon dim">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round">
+            <rect x="4" y="3" width="16" height="18" rx="2.5"/>
+            <circle cx="8"  cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="12" cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="16" cy="9"  r="1" fill="currentColor" stroke="none"/>
+            <circle cx="8"  cy="13" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="12" cy="13" r="1" fill="currentColor" stroke="none"/>
+            <circle cx="16" cy="13" r="1" fill="currentColor" stroke="none"/>
+            <rect x="7" y="16.5" width="10" height="1.5" rx="0.75" fill="currentColor" stroke="none"/>
+          </svg>
+        </div>
+        <div class="kp-info">
+          <div class="kp-name">Keypad Touch (kitchen)</div>
+          <div class="kp-meta">
+            <span class="kp-mac">B0:E9:FE:8A:91:C2</span>
+            <span class="kp-badge offline"><span class="dot"></span>Out of range</span>
+          </div>
+        </div>
+        <button class="btn-pair" disabled>Pair</button>
+      </div>
+    </div>
+
+    <button id="rescan-btn" class="btn btn-secondary">↻ Rescan</button>
+  </section>
+
+  <!-- ─── Pairing progress ─── -->
+  <section id="screen-progress" class="screen hidden">
+    <div class="progress-header">
+      <h2 id="progress-kp-name">Keypad Vision 75</h2>
+      <p class="target" id="progress-kp-mac">B0:E9:FE:61:2E:75</p>
+    </div>
+
+    <div class="progress-track">
+      <div class="progress-fill" id="progress-bar"></div>
+    </div>
+
+    <div class="card" id="progress-card-content">
+      <ul class="stepper" id="progress-stepper">
+        <li class="step active"><span class="indicator"></span>Connecting to keypad</li>
+        <li class="step"><span class="indicator"></span>Discovering services</li>
+        <li class="step"><span class="indicator"></span>Negotiating session key</li>
+        <li class="step"><span class="indicator"></span>Opening lock slot</li>
+        <li class="step"><span class="indicator"></span>Writing shared key (1/2)</li>
+        <li class="step"><span class="indicator"></span>Writing shared key (2/2)</li>
+        <li class="step"><span class="indicator"></span>Updating lock target</li>
+        <li class="step"><span class="indicator"></span>Finalising</li>
+      </ul>
+
+      <!-- Success state — swapped in for the stepper when pairing completes -->
+      <div id="progress-result-success" class="hidden">
+        <div class="result-hero success">
+          <div class="result-icon">
+            <svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <path d="M10 21l7 7 13-14"/>
+            </svg>
+          </div>
+          <h2>Paired!</h2>
+          <p class="desc">Your keypad is connected to this bridge.</p>
+        </div>
+      </div>
+
+      <!-- Error state — swapped in for the stepper when pairing fails -->
+      <div id="progress-result-error" class="hidden">
+        <div class="result-hero error">
+          <div class="result-icon">
+            <svg viewBox="0 0 40 40" fill="none" stroke="currentColor" stroke-width="2.8"
+                 stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="12" x2="28" y2="28"/>
+              <line x1="28" y1="12" x2="12" y2="28"/>
+            </svg>
+          </div>
+          <h2>Pairing failed</h2>
+          <p class="desc">Could not complete the BLE handshake.</p>
+        </div>
+
+        <div class="banner banner-error">
+          <span class="icon">!</span>
+          <span id="error-banner-text">Timed out waiting for the ACK on the finalize command. Move the keypad closer and try again.</span>
+        </div>
+
+        <button class="btn btn-primary" onclick="showScreen('keypads')">Try again</button>
+      </div>
+    </div>
+
+    <p class="footnote" id="progress-hint">Pairing takes about 10 seconds.</p>
+  </section>
+
+</main>
+
+<script>
+  /* The developer navigation bar is only useful when this file is opened
+     straight from disk (file://). Served by the device over HTTP it stays
+     hidden, which lets the firmware embed this page byte-for-byte. */
+  if (location.protocol === 'file:') {
+    document.getElementById('preview-nav').hidden = false;
+  }
+
+  /* Preview-only theme toggle. The real firmware just follows the
+     system color scheme via the @media query. */
+  function toggleTheme() {
+    const root = document.documentElement;
+    const next = root.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+    root.setAttribute('data-theme', next);
+    document.getElementById('theme-toggle').textContent =
+      next === 'dark' ? '☀️ Light' : '🌙 Dark';
+  }
+
+  /* Preview-only screen switcher. The real firmware will use the
+     submit handlers / API calls below. */
+  function showScreen(name) {
+    document.querySelectorAll('.screen').forEach(s => s.classList.add('hidden'));
+    const el = document.getElementById('screen-' + name);
+    if (el) el.classList.remove('hidden');
+    document.querySelectorAll('.preview-nav button').forEach(b => b.classList.remove('active'));
+    const btn = [...document.querySelectorAll('.preview-nav button')]
+      .find(b => b.textContent.trim().toLowerCase().includes(name.replace('result-', '').replace(/-/g, ' ')));
+    if (btn) btn.classList.add('active');
+  }
+
+  /* Preview-only: reset the progress card to its live "pairing in progress"
+     look. Without this the Progress button would still show whichever result
+     (Success / Error) was opened last, since those swap the stepper out. */
+  function previewProgress() {
+    document.getElementById('progress-result-success').classList.add('hidden');
+    document.getElementById('progress-result-error').classList.add('hidden');
+    document.getElementById('progress-stepper').classList.remove('hidden');
+    setProgressHint('Pairing takes about 10 seconds.');
+    const steps = document.querySelectorAll('#progress-stepper .step');
+    steps.forEach((li, i) => {
+      li.classList.remove('done', 'active');
+      if (i < 3) li.classList.add('done');
+      else if (i === 3) li.classList.add('active');
+    });
+    const bar = document.getElementById('progress-bar');
+    bar.style.background = 'var(--sb-theme)';
+    bar.style.width = Math.round((3 / steps.length) * 100) + '%';
+  }
+
+  /* ── REST helpers ───────────────────────────────────────────────────── */
+
+  async function api(method, path, body) {
+    const opts = { method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(path, opts);
+    let data = null;
+    try { data = await res.json(); } catch (_) {}
+    if (!res.ok) {
+      throw new Error((data && data.error) || ('HTTP ' + res.status));
+    }
+    return data;
+  }
+
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => (
+      { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+    ));
+  }
+
+  function setBanner(id, msg) {
+    const el = document.getElementById(id);
+    if (!el) return;
+    if (!msg) { el.style.display = 'none'; return; }
+    const text = el.querySelector('span:last-child');
+    if (text) text.textContent = msg;
+    el.style.display = 'flex';
+  }
+
+  /* ── Login ───────────────────────────────────────────────────────────── */
+
+  document.getElementById('login-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const fd = new FormData(e.target);
+    const btn = e.target.querySelector('button[type="submit"]');
+    const original = btn.innerHTML;
+    btn.disabled = true;
+    btn.textContent = 'Signing in…';
+    setBanner('login-error', null);
+    try {
+      await api('POST', '/api/login', {
+        email: fd.get('email'),
+        password: fd.get('password'),
+      });
+      showScreen('keypads');
+      loadKeypads();
+    } catch (err) {
+      const text = document.getElementById('login-error-text');
+      if (text) text.textContent = err.message;
+      document.getElementById('login-error').style.display = 'flex';
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = original;
+    }
+  });
+
+  /* ── Keypad list ─────────────────────────────────────────────────────── */
+
+  async function loadKeypads() {
+    const list = document.getElementById('keypads-list');
+    list.innerHTML =
+      '<div class="empty-state">' +
+        '<div class="spinner"></div>' +
+        'Searching for keypads…' +
+      '</div>';
+    try {
+      const keypads = await api('GET', '/api/keypads');
+      if (!Array.isArray(keypads) || keypads.length === 0) {
+        list.innerHTML = '<div class="empty-state">No keypads found in your SwitchBot account.</div>';
+        return;
+      }
+      list.innerHTML = '';
+      for (const kp of keypads) {
+        list.appendChild(renderKeypadCard(kp));
+      }
+    } catch (err) {
+      list.innerHTML = '<div class="empty-state">Error: ' + escapeHtml(err.message) + '</div>';
+    }
+  }
+
+  function renderKeypadCard(kp) {
+    const card = document.createElement('div');
+    const offline = !kp.online;
+    card.className = 'kp-card' + (offline ? '' : ' online');
+    const rssiLabel = kp.rssi != null ? '−' + Math.abs(kp.rssi) + ' dBm' : 'Nearby';
+    const badgeClass = offline ? 'offline' : 'online';
+    const badgeText = offline ? 'Out of range' : rssiLabel;
+    const kpSvg =
+      '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+        'stroke-linecap="round" stroke-linejoin="round">' +
+        '<rect x="4" y="3" width="16" height="18" rx="2.5"/>' +
+        '<circle cx="8"  cy="9"  r="1" fill="currentColor" stroke="none"/>' +
+        '<circle cx="12" cy="9"  r="1" fill="currentColor" stroke="none"/>' +
+        '<circle cx="16" cy="9"  r="1" fill="currentColor" stroke="none"/>' +
+        '<circle cx="8"  cy="13" r="1" fill="currentColor" stroke="none"/>' +
+        '<circle cx="12" cy="13" r="1" fill="currentColor" stroke="none"/>' +
+        '<circle cx="16" cy="13" r="1" fill="currentColor" stroke="none"/>' +
+        '<rect x="7" y="16.5" width="10" height="1.5" rx="0.75" fill="currentColor" stroke="none"/>' +
+      '</svg>';
+    card.innerHTML =
+      '<div class="kp-icon' + (offline ? ' dim' : '') + '">' + kpSvg + '</div>' +
+      '<div class="kp-info">' +
+        '<div class="kp-name">' + escapeHtml(kp.name) + '</div>' +
+        '<div class="kp-meta">' +
+          '<span class="kp-mac">' + escapeHtml(kp.mac) + '</span>' +
+          '<span class="kp-badge ' + badgeClass + '"><span class="dot"></span>' + escapeHtml(badgeText) + '</span>' +
+        '</div>' +
+      '</div>' +
+      '<button class="btn-pair"' + (offline ? ' disabled' : '') + '>Pair</button>';
+    card.querySelector('.btn-pair').addEventListener('click', () => {
+      if (offline) return;
+      startPair(kp);
+    });
+    return card;
+  }
+
+  document.getElementById('rescan-btn').addEventListener('click', loadKeypads);
+
+  /* ── Pairing job ─────────────────────────────────────────────────────── */
+
+  let currentKp = null;
+
+  async function startPair(kp) {
+    currentKp = kp;
+    showScreen('progress');
+    document.getElementById('progress-kp-name').textContent = kp.name;
+    document.getElementById('progress-kp-mac').textContent = kp.mac;
+    document.getElementById('progress-bar').style.width = '0%';
+    document.getElementById('progress-bar').style.background = 'var(--sb-theme)';
+    
+    // Reset view to Stepper mode inside the card
+    document.getElementById('progress-stepper').classList.remove('hidden');
+    document.getElementById('progress-result-success').classList.add('hidden');
+    document.getElementById('progress-result-error').classList.add('hidden');
+    setProgressHint('Pairing takes about 10 seconds.');
+
+    document.querySelectorAll('#progress-stepper .step').forEach(li => {
+      li.classList.remove('done', 'active');
+    });
+
+    let jobId;
+    try {
+      const r = await api('POST', '/api/pair', { mac: kp.mac });
+      jobId = r.job_id;
+    } catch (err) {
+      showResultError(err.message);
+      return;
+    }
+    pollPair(jobId);
+  }
+
+  async function pollPair(jobId) {
+    while (true) {
+      await new Promise(r => setTimeout(r, 500));
+      let status;
+      try {
+        status = await api('GET', '/api/pair/status?job_id=' + encodeURIComponent(jobId));
+      } catch (err) {
+        showResultError(err.message);
+        return;
+      }
+      const items = document.querySelectorAll('#progress-stepper .step');
+      items.forEach((li, i) => {
+        li.classList.remove('done', 'active');
+        if (i < status.step) li.classList.add('done');
+        else if (i === status.step && !status.done) li.classList.add('active');
+        else if (status.done && !status.error) li.classList.add('done');
+      });
+      const pct = status.done ? 100 : Math.round((status.step / items.length) * 100);
+      document.getElementById('progress-bar').style.width = pct + '%';
+      if (status.done) {
+        if (status.error) showResultError(status.error);
+        else showResultSuccess();
+        return;
+      }
+    }
+  }
+
+  /* The footnote under the progress card: a state hint while pairing runs,
+     the "you can close this" note on success, hidden on error (the in-card
+     error banner carries that detail instead). Pass null to hide it. */
+  function setProgressHint(text) {
+    const el = document.getElementById('progress-hint');
+    if (text === null) {
+      el.classList.add('hidden');
+      return;
+    }
+    el.textContent = text;
+    el.classList.remove('hidden');
+  }
+
+  function showResultSuccess() {
+    document.getElementById('progress-stepper').classList.add('hidden');
+    setProgressHint('You can close this page — the pairing server shuts down automatically.');
+    document.getElementById('progress-result-error').classList.add('hidden');
+    document.getElementById('progress-result-success').classList.remove('hidden');
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-bar').style.background = 'var(--sb-success)';
+  }
+  
+  function showResultError(msg) {
+    document.getElementById('progress-stepper').classList.add('hidden');
+    setProgressHint(null);
+    document.getElementById('progress-result-success').classList.add('hidden');
+    document.getElementById('progress-result-error').classList.remove('hidden');
+    document.getElementById('progress-bar').style.width = '100%';
+    document.getElementById('progress-bar').style.background = 'var(--sb-theme)'; // Red
+
+    const banner = document.getElementById('error-banner-text');
+    if (banner) banner.textContent = msg;
+  }
+</script>
+</body>
+</html>

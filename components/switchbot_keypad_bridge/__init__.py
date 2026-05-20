@@ -5,54 +5,59 @@ SwitchBot Keypad can deliver encrypted unlock/lock commands. The bridge
 decrypts the frames in-place using mbed-TLS / PSA Crypto and exposes the
 decoded commands through two surfaces:
 
-- A standard ESPHome ``event`` entity (``lock``/``unlock`` types).
+- A standard ESPHome ``event`` entity (``Lock``/``Unlock`` types).
 - ESPHome automation triggers (``on_lock`` / ``on_unlock``) which receive
   the unlock ``method`` and credential ``index`` as arguments.
+
+The AES session key is generated on the device on first boot and kept in
+NVS — it is never part of the YAML configuration.
 """
 
 from __future__ import annotations
 
 import logging
-import re
+from pathlib import Path
 
 import esphome.codegen as cg
 import esphome.config_validation as cv
 import esphome.final_validate as fv
 from esphome import automation
-from esphome.components import event, text_sensor
-from esphome.components.esp32 import add_idf_component, add_idf_sdkconfig_option
-from esphome.const import CONF_ID, CONF_TRIGGER_ID, ENTITY_CATEGORY_DIAGNOSTIC
-from esphome.core import CORE
+from esphome.components import button, event, text_sensor
+from esphome.components.esp32 import (
+    add_idf_component,
+    add_idf_sdkconfig_option,
+    include_builtin_idf_component,
+)
+from esphome.const import CONF_ID, CONF_TRIGGER_ID, ENTITY_CATEGORY_CONFIG, ENTITY_CATEGORY_DIAGNOSTIC
+from esphome.core import CORE, HexInt
 
 LOGGER = logging.getLogger(__name__)
 
 CODEOWNERS = ["@pierluigizagaria"]
 DEPENDENCIES = ["esp32"]
-AUTO_LOAD = ["event", "text_sensor"]
+AUTO_LOAD = ["event", "text_sensor", "button"]
 MULTI_CONF = False
 
-CONF_SHARED_KEY = "shared_key"
+CONF_KEYPAD_ACTION = "keypad_action"
 CONF_KEYPAD = "keypad"
-CONF_BLE_MAC = "ble_mac"
+CONF_UNPAIR_BUTTON = "unpair_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
+CONF_PAIRING_UI = "pairing_ui"
 
-_HEX32_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Auto-generated id for the progmem array that carries the embedded UI.
+CONF_PAIRING_UI_HTML_ID = "pairing_ui_html_id"
 
-
-def _validate_shared_key(value):
-    value = cv.string_strict(value)
-    if not _HEX32_RE.match(value):
-        raise cv.Invalid(
-            f"Invalid shared_key: expected 32 hexadecimal characters (got {len(value)})."
-        )
-    return value.upper()
+# The pairing wizard is a single, self-contained HTML file living next to
+# this module. It doubles as a browser-openable design preview.
+PAIRING_UI_HTML = Path(__file__).parent / "pairing_ui.html"
 
 
 switchbot_keypad_bridge_ns = cg.esphome_ns.namespace("switchbot_keypad_bridge")
 SwitchbotKeypadBridge = switchbot_keypad_bridge_ns.class_(
     "SwitchbotKeypadBridge", cg.Component
 )
+UnpairButton = switchbot_keypad_bridge_ns.class_("UnpairButton", button.Button)
 LockTrigger = switchbot_keypad_bridge_ns.class_(
     "LockTrigger", automation.Trigger.template()
 )
@@ -63,12 +68,18 @@ UnlockTrigger = switchbot_keypad_bridge_ns.class_(
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SwitchbotKeypadBridge),
-        cv.Required(CONF_SHARED_KEY): _validate_shared_key,
-        cv.Optional(CONF_KEYPAD): event.event_schema(icon="mdi:dialpad"),
-        cv.Optional(CONF_BLE_MAC): text_sensor.text_sensor_schema(
+        cv.Optional(CONF_KEYPAD_ACTION): event.event_schema(icon="mdi:gesture-tap"),
+        cv.Optional(CONF_KEYPAD): text_sensor.text_sensor_schema(
+            icon="mdi:dialpad",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-            icon="mdi:bluetooth",
         ),
+        cv.Optional(CONF_PAIRING_UI, default=False): cv.boolean,
+        cv.Optional(CONF_UNPAIR_BUTTON): button.button_schema(
+            UnpairButton,
+            entity_category=ENTITY_CATEGORY_CONFIG,
+            icon="mdi:link-off",
+        ),
+        cv.GenerateID(CONF_PAIRING_UI_HTML_ID): cv.declare_id(cg.uint8),
         cv.Optional(CONF_ON_LOCK): automation.validate_automation(
             {cv.GenerateID(CONF_TRIGGER_ID): cv.declare_id(LockTrigger)}
         ),
@@ -107,6 +118,24 @@ def _final_validate(config):
                 "NimBLE benefits from the extra heap."
             )
 
+    # The pairing wizard binds to port 80 and reuses ESPHome's
+    # USE_WEBSERVER flag for HA discovery. Both clash with the official
+    # `web_server:` component, which also defines USE_WEBSERVER and (by
+    # default) listens on 80.
+    if config.get(CONF_PAIRING_UI) and "web_server" in full_config:
+        raise cv.Invalid(
+            "switchbot_keypad_bridge.pairing_ui cannot coexist with the "
+            "`web_server:` component — both bind to port 80 and both define "
+            "USE_WEBSERVER. Remove `web_server:` or set pairing_ui: false."
+        )
+
+    # The unpair button re-opens the pairing wizard, so it only makes sense
+    # with the wizard compiled in.
+    if config.get(CONF_UNPAIR_BUTTON) and not config.get(CONF_PAIRING_UI):
+        raise cv.Invalid(
+            "switchbot_keypad_bridge.unpair_button requires `pairing_ui: true`."
+        )
+
     return config
 
 
@@ -117,15 +146,46 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    cg.add(var.set_shared_key(config[CONF_SHARED_KEY]))
-
-    if keypad_conf := config.get(CONF_KEYPAD):
-        keypad = await event.new_event(keypad_conf, event_types=["lock", "unlock"])
+    if keypad_conf := config.get(CONF_KEYPAD_ACTION):
+        keypad = await event.new_event(keypad_conf, event_types=["Lock", "Unlock"])
         cg.add(var.set_keypad_event(keypad))
 
-    if ble_mac_conf := config.get(CONF_BLE_MAC):
-        sens = await text_sensor.new_text_sensor(ble_mac_conf)
-        cg.add(var.set_ble_mac_text_sensor(sens))
+    if keypad_sensor_conf := config.get(CONF_KEYPAD):
+        sens = await text_sensor.new_text_sensor(keypad_sensor_conf)
+        cg.add(var.set_keypad_text_sensor(sens))
+
+    cg.add(var.set_pairing_ui_enabled(config[CONF_PAIRING_UI]))
+
+    if button_conf := config.get(CONF_UNPAIR_BUTTON):
+        btn = await button.new_button(button_conf)
+        await cg.register_parented(btn, config[CONF_ID])
+
+    if config[CONF_PAIRING_UI]:
+        # Enable ESP-IDF's CA certificate bundle. The pairing wizard makes
+        # HTTPS requests to the SwitchBot API, which fail during the TLS
+        # handshake (ESP_ERR_HTTP_CONNECT) if the system lacks root CAs.
+        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True)
+
+        # Make Home Assistant show the "Visit Device" link on the device
+        # page. ESPHome's api component fills `webserver_port` in
+        # DeviceInfoResponse iff USE_WEBSERVER is defined; HA uses that
+        # field to construct the URL. We piggy-back on the same flag so
+        # the pairing wizard gets discovered without requiring the user
+        # to also enable `web_server:` in YAML.
+        cg.add_define("USE_WEBSERVER")
+        cg.add_define("USE_WEBSERVER_PORT", 80)
+
+        # Bake the pairing wizard's HTML straight into the firmware image
+        # as a PROGMEM array. `pairing_ui.html` is the single source of
+        # truth — there is no generated header to commit and no build
+        # script to run by hand; `esphome compile` picks up edits to the
+        # file directly.
+        html_bytes = PAIRING_UI_HTML.read_bytes()
+        html_arr = cg.progmem_array(
+            config[CONF_PAIRING_UI_HTML_ID], [HexInt(b) for b in html_bytes]
+        )
+        cg.add(var.set_pairing_ui_html(html_arr, len(html_bytes)))
 
     for trig_conf in config.get(CONF_ON_LOCK, []):
         trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
@@ -153,3 +213,16 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_NIMBLE_CPP_LOG_LEVEL", 0)
     add_idf_sdkconfig_option("CONFIG_BT_NIMBLE_LOG_LEVEL", 0)
     add_idf_sdkconfig_option("CONFIG_BT_NIMBLE_LOG_LEVEL_NONE", True)
+
+    # The cloud client calls https://*.switchbot.net — pull in mbedTLS's
+    # built-in certificate bundle so esp_crt_bundle_attach() finds the
+    # CAs that sign those domains. Also tell ESP-IDF that this user
+    # component depends on esp_http_client and the cert bundle so the
+    # headers and link symbols are visible to cloud_client.cpp.
+    if config.get(CONF_PAIRING_UI):
+        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+        add_idf_sdkconfig_option(
+            "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True
+        )
+        include_builtin_idf_component("esp_http_client")
+        include_builtin_idf_component("esp-tls")
