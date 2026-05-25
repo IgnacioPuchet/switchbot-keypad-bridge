@@ -57,7 +57,6 @@ class SwitchbotKeypadBridge : public Component {
   float get_setup_priority() const override { return setup_priority::AFTER_WIFI; }
 
   void set_keypad_event(event::Event *ev) { this->keypad_event_ = ev; }
-  void set_pairing_ui_enabled(bool enabled) { this->pairing_ui_enabled_ = enabled; }
   void set_pairing_ui_html(const uint8_t *html, size_t len) {
     this->pairing_ui_.set_html(html, len);
   }
@@ -172,7 +171,6 @@ class SwitchbotKeypadBridge : public Component {
 
   // ----- On-device pairing wizard --------------------------------------------
 
-  bool pairing_ui_enabled_{false};
   PairingUi pairing_ui_{};
 
   // A finished pairing is signalled from the HTTP-server task; loop() (the

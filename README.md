@@ -169,8 +169,7 @@ different actions for each family member.
 |---|---|---|---|
 | `keypad_action` | event | no | Standard ESPHome `event` entity for keypad actions. Surfaces in HA as `event.<device>_action` with `Lock` / `Unlock` event types. |
 | `keypad` | text_sensor | no | Text sensor whose state is the display name of the paired keypad (Configuration category; empty if none). |
-| `pairing_ui` | boolean | no | Compiles in the on-device pairing wizard. Default `false`. The wizard opens automatically at boot while no keypad is paired. |
-| `unpair_button` | button | no | Button that forgets the paired keypad, rotates the session key and re-opens the pairing wizard (no reboot). Requires `pairing_ui: true`. |
+| `unpair_button` | button | no | Button that forgets the paired keypad, rotates the session key and re-opens the pairing wizard (no reboot). |
 | `on_lock` | automation | no | Triggered on every `lock` command. |
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |
 

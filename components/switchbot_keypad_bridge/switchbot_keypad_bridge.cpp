@@ -174,23 +174,21 @@ void SwitchbotKeypadBridge::setup() {
   ESP_LOGI(TAG, "Ready. Advertising on %s",
            NimBLEDevice::getAddress().toString().c_str());
 
-  if (this->pairing_ui_enabled_) {
-    this->pairing_ui_.set_shared_key(this->shared_key_);
-    this->pairing_ui_.set_on_paired_callback([this](const std::string &name) {
-      // Runs on the HTTP-server task — keep it minimal: stash the name and
-      // raise a flag. loop() (the main task) publishes the text sensor,
-      // writes NVS and stops the server.
-      this->pending_keypad_name_ = name;
-      this->pending_pair_apply_.store(true, std::memory_order_release);
-    });
-    // Pairing mode: with no keypad paired yet, open the wizard right away
-    // so the very first pairing needs no button press.
-    if (!have_keypad) {
-      if (this->pairing_ui_.start()) {
-        ESP_LOGI(TAG, "No keypad paired — pairing mode active on http://<device>/");
-      } else {
-        ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
-      }
+  this->pairing_ui_.set_shared_key(this->shared_key_);
+  this->pairing_ui_.set_on_paired_callback([this](const std::string &name) {
+    // Runs on the HTTP-server task — keep it minimal: stash the name and
+    // raise a flag. loop() (the main task) publishes the text sensor,
+    // writes NVS and stops the server.
+    this->pending_keypad_name_ = name;
+    this->pending_pair_apply_.store(true, std::memory_order_release);
+  });
+  // Pairing mode: with no keypad paired yet, open the wizard right away
+  // so the very first pairing needs no button press.
+  if (!have_keypad) {
+    if (this->pairing_ui_.start()) {
+      ESP_LOGI(TAG, "No keypad paired — pairing mode active on http://<device>/");
+    } else {
+      ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
     }
   }
 }
@@ -271,13 +269,11 @@ void SwitchbotKeypadBridge::unpair() {
   this->shared_slot_id_ = 0x00;
 
   // Re-enter pairing mode straight away with the rotated key.
-  if (this->pairing_ui_enabled_) {
-    this->pairing_ui_.set_shared_key(this->shared_key_);
-    if (this->pairing_ui_.start()) {
-      ESP_LOGI(TAG, "Unpaired — pairing mode active on http://<device>/");
-    } else {
-      ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
-    }
+  this->pairing_ui_.set_shared_key(this->shared_key_);
+  if (this->pairing_ui_.start()) {
+    ESP_LOGI(TAG, "Unpaired — pairing mode active on http://<device>/");
+  } else {
+    ESP_LOGW(TAG, "Pairing UI failed to start; check port 80 is free");
   }
 }
 
@@ -292,8 +288,7 @@ void UnpairButton::press_action() {
 void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "SwitchBot Keypad Bridge:");
   ESP_LOGCONFIG(TAG, "  BLE address: %s", NimBLEDevice::getAddress().toString().c_str());
-  ESP_LOGCONFIG(TAG, "  Pairing UI: %s",
-                this->pairing_ui_enabled_ ? "enabled (port 80)" : "disabled");
+  ESP_LOGCONFIG(TAG, "  Pairing UI: port 80");
   if (this->is_failed()) {
     ESP_LOGE(TAG, "  Initialization failed - see previous errors");
   }

@@ -2,11 +2,14 @@
 
 #include <cctype>
 #include <cstring>
+#include <ctime>
 
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
 #include <esp_tls.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #include "esphome/core/log.h"
 
@@ -168,6 +171,22 @@ bool CloudClient::post_json_(const std::string &url, const std::string &body,
                              const std::string &bearer, std::string &out,
                              std::string &error_out) {
   out.clear();
+
+  // TLS cert validation needs a valid system clock — at first boot the ESP32
+  // wakes up at the epoch, so cert.notBefore checks fail and the handshake
+  // errors out as ESP_ERR_HTTP_CONNECT. Wait briefly for SNTP (or HA-API
+  // sync) to set the clock before issuing the request.
+  constexpr time_t MIN_VALID_TIME = 1700000000;  // 2023-11-14
+  const TickType_t start = xTaskGetTickCount();
+  while (time(nullptr) < MIN_VALID_TIME) {
+    if ((xTaskGetTickCount() - start) > pdMS_TO_TICKS(10000)) {
+      error_out = "Device clock not set — TLS needs a valid system time. Add "
+                  "`time: - platform: sntp` to the YAML, or wait until Home "
+                  "Assistant connects (its API component syncs the clock).";
+      return false;
+    }
+    vTaskDelay(pdMS_TO_TICKS(200));
+  }
 
   esp_http_client_config_t cfg = {};
   cfg.url = url.c_str();

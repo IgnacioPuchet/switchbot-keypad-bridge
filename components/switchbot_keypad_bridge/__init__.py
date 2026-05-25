@@ -65,6 +65,24 @@ UnlockTrigger = switchbot_keypad_bridge_ns.class_(
     "UnlockTrigger", automation.Trigger.template(cg.std_string, cg.int_)
 )
 
+
+def _deprecated_pairing_ui(value):
+    """The on-device wizard is now always compiled in. Accept ``true`` for
+    backwards compatibility (with a deprecation warning) and reject ``false``
+    explicitly so users who tried to disable it learn what changed."""
+    v = cv.boolean(value)
+    if v is False:
+        raise cv.Invalid(
+            "pairing_ui: false is no longer supported — the on-device pairing "
+            "wizard is always compiled in. Remove this option."
+        )
+    LOGGER.warning(
+        "switchbot_keypad_bridge: the 'pairing_ui' option is deprecated and "
+        "can be removed — the wizard is now always available."
+    )
+    return v
+
+
 CONFIG_SCHEMA = cv.Schema(
     {
         cv.GenerateID(): cv.declare_id(SwitchbotKeypadBridge),
@@ -73,7 +91,7 @@ CONFIG_SCHEMA = cv.Schema(
             icon="mdi:dialpad",
             entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
         ),
-        cv.Optional(CONF_PAIRING_UI, default=False): cv.boolean,
+        cv.Optional(CONF_PAIRING_UI): _deprecated_pairing_ui,
         cv.Optional(CONF_UNPAIR_BUTTON): button.button_schema(
             UnpairButton,
             entity_category=ENTITY_CATEGORY_CONFIG,
@@ -118,22 +136,15 @@ def _final_validate(config):
                 "NimBLE benefits from the extra heap."
             )
 
-    # The pairing wizard binds to port 80 and reuses ESPHome's
-    # USE_WEBSERVER flag for HA discovery. Both clash with the official
-    # `web_server:` component, which also defines USE_WEBSERVER and (by
-    # default) listens on 80.
-    if config.get(CONF_PAIRING_UI) and "web_server" in full_config:
+    # The pairing wizard binds to port 80 and reuses ESPHome's USE_WEBSERVER
+    # flag for HA discovery. Both clash with the official `web_server:`
+    # component, which also defines USE_WEBSERVER and (by default) listens
+    # on 80.
+    if "web_server" in full_config:
         raise cv.Invalid(
-            "switchbot_keypad_bridge.pairing_ui cannot coexist with the "
-            "`web_server:` component — both bind to port 80 and both define "
-            "USE_WEBSERVER. Remove `web_server:` or set pairing_ui: false."
-        )
-
-    # The unpair button re-opens the pairing wizard, so it only makes sense
-    # with the wizard compiled in.
-    if config.get(CONF_UNPAIR_BUTTON) and not config.get(CONF_PAIRING_UI):
-        raise cv.Invalid(
-            "switchbot_keypad_bridge.unpair_button requires `pairing_ui: true`."
+            "switchbot_keypad_bridge cannot coexist with the `web_server:` "
+            "component — both bind to port 80 and both define USE_WEBSERVER. "
+            "Remove `web_server:`."
         )
 
     return config
@@ -154,38 +165,26 @@ async def to_code(config):
         sens = await text_sensor.new_text_sensor(keypad_sensor_conf)
         cg.add(var.set_keypad_text_sensor(sens))
 
-    cg.add(var.set_pairing_ui_enabled(config[CONF_PAIRING_UI]))
-
     if button_conf := config.get(CONF_UNPAIR_BUTTON):
         btn = await button.new_button(button_conf)
         await cg.register_parented(btn, config[CONF_ID])
 
-    if config[CONF_PAIRING_UI]:
-        # Enable ESP-IDF's CA certificate bundle. The pairing wizard makes
-        # HTTPS requests to the SwitchBot API, which fail during the TLS
-        # handshake (ESP_ERR_HTTP_CONNECT) if the system lacks root CAs.
-        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
-        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True)
+    # Make Home Assistant show the "Visit Device" link on the device page.
+    # ESPHome's api component fills `webserver_port` in DeviceInfoResponse
+    # iff USE_WEBSERVER is defined; HA uses that field to construct the URL.
+    # We piggy-back on the same flag so the pairing wizard gets discovered
+    # without requiring the user to also enable `web_server:` in YAML.
+    cg.add_define("USE_WEBSERVER")
+    cg.add_define("USE_WEBSERVER_PORT", 80)
 
-        # Make Home Assistant show the "Visit Device" link on the device
-        # page. ESPHome's api component fills `webserver_port` in
-        # DeviceInfoResponse iff USE_WEBSERVER is defined; HA uses that
-        # field to construct the URL. We piggy-back on the same flag so
-        # the pairing wizard gets discovered without requiring the user
-        # to also enable `web_server:` in YAML.
-        cg.add_define("USE_WEBSERVER")
-        cg.add_define("USE_WEBSERVER_PORT", 80)
-
-        # Bake the pairing wizard's HTML straight into the firmware image
-        # as a PROGMEM array. `pairing_ui.html` is the single source of
-        # truth — there is no generated header to commit and no build
-        # script to run by hand; `esphome compile` picks up edits to the
-        # file directly.
-        html_bytes = PAIRING_UI_HTML.read_bytes()
-        html_arr = cg.progmem_array(
-            config[CONF_PAIRING_UI_HTML_ID], [HexInt(b) for b in html_bytes]
-        )
-        cg.add(var.set_pairing_ui_html(html_arr, len(html_bytes)))
+    # Bake the pairing wizard's HTML straight into the firmware image as a
+    # PROGMEM array. `pairing_ui.html` is the single source of truth — no
+    # generated header to commit, no build step to run by hand.
+    html_bytes = PAIRING_UI_HTML.read_bytes()
+    html_arr = cg.progmem_array(
+        config[CONF_PAIRING_UI_HTML_ID], [HexInt(b) for b in html_bytes]
+    )
+    cg.add(var.set_pairing_ui_html(html_arr, len(html_bytes)))
 
     for trig_conf in config.get(CONF_ON_LOCK, []):
         trig = cg.new_Pvariable(trig_conf[CONF_TRIGGER_ID], var)
@@ -215,14 +214,12 @@ async def to_code(config):
     add_idf_sdkconfig_option("CONFIG_BT_NIMBLE_LOG_LEVEL_NONE", True)
 
     # The cloud client calls https://*.switchbot.net — pull in mbedTLS's
-    # built-in certificate bundle so esp_crt_bundle_attach() finds the
-    # CAs that sign those domains. Also tell ESP-IDF that this user
-    # component depends on esp_http_client and the cert bundle so the
+    # built-in certificate bundle so esp_crt_bundle_attach() finds the CAs
+    # that sign those domains. Without CONFIG_MBEDTLS_CERTIFICATE_BUNDLE the
+    # TLS handshake fails with ESP_ERR_HTTP_CONNECT. Also tell ESP-IDF that
+    # this user component depends on esp_http_client and esp-tls so the
     # headers and link symbols are visible to cloud_client.cpp.
-    if config.get(CONF_PAIRING_UI):
-        add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
-        add_idf_sdkconfig_option(
-            "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True
-        )
-        include_builtin_idf_component("esp_http_client")
-        include_builtin_idf_component("esp-tls")
+    add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
+    add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True)
+    include_builtin_idf_component("esp_http_client")
+    include_builtin_idf_component("esp-tls")

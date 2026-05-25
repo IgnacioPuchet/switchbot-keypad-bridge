@@ -22,9 +22,12 @@ ota:
   - platform: esphome
     password: !secret ota_password
 
-switchbot_keypad_bridge:
-  pairing_ui: true
+# TLS in the pairing wizard needs a valid system clock; SNTP keeps it set
+# even before Home Assistant connects.
+time:
+  - platform: sntp
 
+switchbot_keypad_bridge:
   keypad_action:
     name: "Action"
 
