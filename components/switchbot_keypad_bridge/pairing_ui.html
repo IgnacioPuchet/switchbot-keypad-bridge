@@ -745,6 +745,11 @@
   /* ── Keypad list ─────────────────────────────────────────────────────── */
 
   async function loadKeypads() {
+    // /api/keypads runs a ~4s BLE scan; lock the Rescan button so the user
+    // can't fire concurrent scans by clicking again while one is running.
+    const btn = document.getElementById('rescan-btn');
+    if (btn.disabled) return;
+    btn.disabled = true;
     const list = document.getElementById('keypads-list');
     list.innerHTML =
       '<div class="empty-state">' +
@@ -763,6 +768,8 @@
       }
     } catch (err) {
       list.innerHTML = '<div class="empty-state">Error: ' + escapeHtml(err.message) + '</div>';
+    } finally {
+      btn.disabled = false;
     }
   }
 
