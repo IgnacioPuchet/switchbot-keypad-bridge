@@ -28,7 +28,6 @@ from esphome.components import button, event, sensor, text_sensor
 from esphome.components.esp32 import (
     add_idf_component,
     add_idf_sdkconfig_option,
-    include_builtin_idf_component,
 )
 from esphome.const import (
     CONF_BATTERY_LEVEL,
@@ -269,5 +268,5 @@ async def to_code(config):
     # headers and link symbols are visible to cloud_client.cpp.
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True)
-    include_builtin_idf_component("esp_http_client")
-    include_builtin_idf_component("esp-tls")
+    #include_builtin_idf_component("esp_http_client")
+    #include_builtin_idf_component("esp-tls")
